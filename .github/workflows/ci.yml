@@ -1,0 +1,304 @@
+# Copyright (c) 2026 kogeler. SPDX-License-Identifier: MIT.
+
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_call:
+    inputs:
+      base_ref:
+        description: Optional exact base commit for version progression
+        required: false
+        type: string
+      upload_distributions:
+        description: Upload the gated wheel and sdist for the release caller
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Exact base branch or commit for version progression
+        required: false
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  quality:
+    name: Source quality and repository policy
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            Makefile
+
+      - name: Run source and repository policy contracts
+        env:
+          RUFF_OUTPUT_FORMAT: github
+        run: make quality policy PY=python
+
+  compatibility:
+    name: Compatibility and coverage (Ubuntu 26.04, CPython ${{ matrix.python }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.13"
+          - "3.14"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up declared Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Run service-independent tests once with blocking coverage
+        run: make test-full test-network-block PY=python
+
+      - name: Publish blocking coverage summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [[ -s .artifacts/coverage-report.md ]]; then
+            cat .artifacts/coverage-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' 'Coverage data was not produced.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+  distribution:
+    name: Wheel and sdist installation
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-package.txt
+
+      - name: Build and clean-install both distributions
+        run: make package smoke reproducibility PY=python
+
+      - name: Hand the gated distributions to the release caller
+        if: ${{ inputs.upload_distributions == true }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-distributions
+          path: |
+            dist/ssh_wrapper-*.whl
+            dist/ssh_wrapper-*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  openssh-acceptance:
+    name: Hermetic real OpenSSH acceptance
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Provision the matching OpenSSH server fixture
+        run: |
+          client_version="$(dpkg-query --show --showformat='${Version}' openssh-client)"
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            "openssh-server=${client_version}"
+          server_version="$(dpkg-query --show --showformat='${Version}' openssh-server)"
+          test "$server_version" = "$client_version"
+
+      - name: Verify OpenSSH commands
+        run: |
+          command -v ssh
+          command -v sshd
+          command -v ssh-keygen
+
+      - name: Run isolated loopback acceptance
+        run: make test-acceptance PY=python
+
+  dependency-review:
+    name: Dependency review and exact-lock audit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review same-repository dependency changes
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+          fail-on-scopes: runtime, development, unknown
+          comment-summary-in-pr: never
+
+      - name: Set up Python for exact-lock audit
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Audit every exact lock on every CI event
+        run: make audit PY=python
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        with:
+          category: /language:${{ matrix.language }}
+
+  version:
+    name: Exact version progression
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    env:
+      BASE_REF: ${{ inputs.base_ref || github.event.pull_request.base.sha || github.event.before }}
+      ZERO_SHA: "0000000000000000000000000000000000000000"
+    steps:
+      - name: Check out base revision
+        if: env.BASE_REF != '' && env.BASE_REF != env.ZERO_SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BASE_REF }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out proposed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Resolve unpublished-version recovery baseline
+        id: baseline
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          VERSION_PATH: source/.version
+        with:
+          script: |
+            const fs = await import("node:fs/promises");
+            const version = (await fs.readFile(process.env.VERSION_PATH, "utf8")).trim();
+            if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(version)) {
+              throw new Error(".version is not a stable semantic version");
+            }
+            try {
+              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: `v${version}` });
+              core.setOutput("unpublished_base_version", "");
+              return;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            let latestVersion = "0.0.0";
+            try {
+              const latest = await github.rest.repos.getLatestRelease({ ...context.repo });
+              latestVersion = latest.data.tag_name.replace(/^v/, "");
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(latestVersion)) {
+              throw new Error("latest release is not a stable vX.Y.Z tag");
+            }
+            core.setOutput("unpublished_base_version", latestVersion);
+
+      - name: Compare exact base and proposed versions
+        working-directory: source
+        env:
+          UNPUBLISHED_BASE_VERSION: ${{ steps.baseline.outputs.unpublished_base_version }}
+        run: |
+          if [[ -n "$BASE_REF" && "$BASE_REF" != "$ZERO_SHA" ]]; then
+            base_version="$(tr -d '\r\n' < ../base/.version)"
+          else
+            base_version="0.0.0"
+          fi
+          current_version="$(tr -d '\r\n' < .version)"
+          args="--base-version $base_version"
+          if [[ "$current_version" == "$base_version" && -n "$UNPUBLISHED_BASE_VERSION" ]]; then
+            args+=" --unpublished-base-version $UNPUBLISHED_BASE_VERSION"
+          fi
+          make version-check PY=python VERSION_ARGS="$args"

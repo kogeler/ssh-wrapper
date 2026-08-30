@@ -1,0 +1,9 @@
+# Copyright (c) 2026 kogeler
+# SPDX-License-Identifier: MIT
+
+# actionlint's custom-label bucket is named "self-hosted-runner" even when it
+# teaches the parser a new GitHub-hosted preview label. Workflow policy still
+# requires every jobs.<job>.runs-on value to be the hosted ubuntu-26.04 label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

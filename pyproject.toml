@@ -1,0 +1,96 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssh-wrapper"
+dynamic = ["version"]
+description = "One-auth OpenSSH ControlMaster lifecycle with mux-only channels"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.13,<3.15"
+authors = [{ name = "kogeler" }]
+maintainers = [{ name = "kogeler" }]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["openssh", "ssh", "controlmaster", "multiplexing", "asyncio"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "bandit[toml]==1.9.4",
+    "mypy==2.3.1",
+    "pip-audit==2.10.1",
+    "ruff==0.16.4",
+]
+test = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "pytest-cov==7.1.0",
+]
+package = [
+    "build==1.5.0",
+    "setuptools==84.0.0",
+    "wheel==0.48.0",
+]
+docs = ["mkdocs-material==9.7.7"]
+
+[dependency-groups]
+resolver-bootstrap = [
+    "pip==26.2.1",
+    "setuptools==84.0.0",
+    "pip-tools==7.6.1",
+    "build==1.5.0",
+    "click==8.5.0",
+    "packaging==26.3",
+    "pyproject-hooks==1.2.0",
+    "wheel==0.48.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["ssh_wrapper*"]
+
+[tool.setuptools.package-data]
+ssh_wrapper = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { file = ".version" }
+
+[project.urls]
+Homepage = "https://kogeler.github.io/ssh-wrapper/"
+Documentation = "https://kogeler.github.io/ssh-wrapper/"
+Repository = "https://github.com/kogeler/ssh-wrapper"
+Issues = "https://github.com/kogeler/ssh-wrapper/issues"
+Changelog = "https://github.com/kogeler/ssh-wrapper/blob/main/CHANGELOG.md"
+
+[tool.mypy]
+files = ["ssh_wrapper"]
+python_version = "3.13"
+strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["ssh_wrapper"]
+
+[tool.coverage.report]
+fail_under = 80
+precision = 2
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@overload",
+]

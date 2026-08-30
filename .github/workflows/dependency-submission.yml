@@ -1,0 +1,123 @@
+# Copyright (c) 2026 kogeler. SPDX-License-Identifier: MIT.
+
+name: Dependency submission
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - pyproject.toml
+      - "requirements-*.txt"
+      - Makefile
+      - tools/dependency_policy.py
+      - .github/scripts/dependency_snapshot.py
+      - .github/workflows/dependency-submission.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-submission-main
+  cancel-in-progress: true
+
+jobs:
+  dependency-submission:
+    name: Submit all four exact lock manifests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out trusted main revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Build deterministic manifests offline
+        run: make dependency-snapshot PY=python
+
+      - name: Submit validated manifests
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          EXPECTED_REPOSITORY: kogeler/ssh-wrapper
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = await import("node:fs/promises");
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (repository !== process.env.EXPECTED_REPOSITORY) {
+              throw new Error(`Refusing dependency submission for ${repository}`);
+            }
+            if (context.ref !== "refs/heads/main" || context.eventName !== "push") {
+              throw new Error("Dependency submission requires a direct main push");
+            }
+            const snapshot = JSON.parse(
+              await fs.readFile(".artifacts/dependency-snapshot.json", "utf8"),
+            );
+            if (
+              !snapshot || typeof snapshot !== "object" || Array.isArray(snapshot) ||
+              Object.keys(snapshot).length !== 1 ||
+              !snapshot.manifests || typeof snapshot.manifests !== "object" ||
+              Array.isArray(snapshot.manifests)
+            ) {
+              throw new Error("Dependency snapshot has an invalid top-level shape");
+            }
+            const expected = [
+              "requirements-dev.txt",
+              "requirements-docs.txt",
+              "requirements-package.txt",
+              "requirements-test.txt",
+            ];
+            const actual = Object.keys(snapshot.manifests).sort();
+            if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+              throw new Error(`Unexpected dependency manifests: ${actual.join(", ")}`);
+            }
+            for (const name of expected) {
+              const manifest = snapshot.manifests[name];
+              if (
+                manifest?.name !== name ||
+                manifest?.file?.source_location !== name ||
+                !manifest?.resolved || typeof manifest.resolved !== "object" ||
+                Array.isArray(manifest.resolved) ||
+                Object.keys(manifest.resolved).length === 0
+              ) {
+                throw new Error(`Invalid dependency manifest: ${name}`);
+              }
+            }
+            const response = await github.request(
+              "POST /repos/{owner}/{repo}/dependency-graph/snapshots",
+              {
+                ...context.repo,
+                version: 0,
+                sha: context.sha,
+                ref: context.ref,
+                job: {
+                  correlator: "ssh-wrapper-pip-locks",
+                  id: String(context.runId),
+                  html_url: `${context.serverUrl}/${repository}/actions/runs/${context.runId}`,
+                },
+                detector: {
+                  name: "ssh-wrapper-pip-locks",
+                  version: "1",
+                  url: `${context.serverUrl}/${repository}/blob/${context.sha}/.github/scripts/dependency_snapshot.py`,
+                },
+                scanned: new Date().toISOString(),
+                manifests: snapshot.manifests,
+                headers: {
+                  accept: "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2026-03-10",
+                },
+              },
+            );
+            if (response.status !== 201 || response.data.result !== "SUCCESS") {
+              throw new Error(
+                `Dependency submission failed: ${response.status} ${response.data.result}`,
+              );
+            }
+            core.notice(response.data.message);

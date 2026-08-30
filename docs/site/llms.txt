@@ -1,0 +1,15 @@
+# ssh-wrapper
+
+Canonical documentation: https://kogeler.github.io/ssh-wrapper/
+Source: https://github.com/kogeler/ssh-wrapper
+
+ssh-wrapper is a typed, standard-library-only CPython 3.13 and 3.14 library for
+Linux that owns one native OpenSSH ControlMaster, constructs mux-only secondary
+channels, and can heartbeat-supervise one owned remote process group.
+
+Start with:
+- /ssh-wrapper/user/installation/
+- /ssh-wrapper/user/usage/
+- /ssh-wrapper/user/api/
+- /ssh-wrapper/user/security/
+- /ssh-wrapper/contracts/

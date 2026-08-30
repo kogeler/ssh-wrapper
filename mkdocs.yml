@@ -1,0 +1,83 @@
+site_name: SSH Wrapper
+site_description: >-
+  Typed one-auth OpenSSH ControlMaster lifecycle with mux-only channels and
+  owned remote-process cleanup.
+site_url: https://kogeler.github.io/ssh-wrapper/
+site_author: kogeler
+copyright: Copyright 2026 kogeler. MIT licensed.
+
+repo_url: https://github.com/kogeler/ssh-wrapper
+repo_name: kogeler/ssh-wrapper
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: en
+  font: false
+  icon:
+    logo: material/console-network-outline
+    repo: fontawesome/brands/github
+  features:
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - content.action.edit
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+
+plugins:
+  - search
+
+hooks:
+  - docs/site/hooks.py
+
+exclude_docs: |
+  site/hooks.py
+  site/llms.txt
+  site/robots.txt
+  site/__pycache__/**
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/kogeler/ssh-wrapper
+      name: ssh-wrapper on GitHub
+  generator: false
+
+nav:
+  - Home: index.md
+  - Users:
+      - Installation: user/installation.md
+      - Usage: user/usage.md
+      - Public API: user/api.md
+      - Security: user/security.md
+  - Contracts:
+      - Catalog: contracts/README.md
+      - Package: contracts/package.md
+      - Dependencies: contracts/dependencies.md
+      - CI and releases: contracts/ci_releases.md
+      - Security: contracts/security.md
+      - Public API: contracts/api.md
+      - Compatibility: contracts/compatibility.md
+  - Maintainers:
+      - Architecture: maintenance/architecture.md
+      - Development: maintenance/development.md
+      - Dependencies: maintenance/dependencies.md
+      - Releases: maintenance/releases.md
+      - Security: maintenance/security.md
+  - Changelog: https://github.com/kogeler/ssh-wrapper/blob/main/CHANGELOG.md
