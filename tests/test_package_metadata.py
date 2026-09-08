@@ -59,11 +59,8 @@ def test_pypi_metadata_exposes_exact_public_routes_and_python() -> None:
         "Changelog": "https://github.com/kogeler/ssh-wrapper/blob/main/CHANGELOG.md",
     }
     assert document["build-system"]["build-backend"] == "setuptools.build_meta"
-    assert document["build-system"]["requires"] == [
-        requirement
-        for requirement in project["optional-dependencies"]["package"]
-        if requirement.startswith("setuptools==")
-    ]
+    assert "optional-dependencies" not in project
+    assert document["build-system"]["requires"] == ["setuptools>=84"]
 
 
 def test_pypi_readme_uses_only_portable_https_links() -> None:
@@ -138,6 +135,7 @@ def test_inline_typing_configuration_is_packaged() -> None:
     assert 'message.get("Keywords")' in verifier
     assert 'message.get_all("Classifier", [])' in verifier
     assert 'message.get_all("Requires-Dist", [])' in verifier
+    assert 'read_input(root / "requirements-package.in").get("setuptools")' in verifier
     assert 'files["PKG-INFO"] != files["ssh_wrapper.egg-info/PKG-INFO"]' in verifier
     assert "mypy" in (ROOT / "tools/smoke_distribution.py").read_text(encoding="utf-8")
 

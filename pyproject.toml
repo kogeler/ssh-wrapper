@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==84.0.0"]
+requires = ["setuptools>=84"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -28,31 +28,12 @@ classifiers = [
 ]
 dependencies = []
 
-[project.optional-dependencies]
-dev = [
-    "bandit[toml]==1.9.4",
-    "mypy==2.3.1",
-    "pip-audit==2.10.1",
-    "ruff==0.16.4",
-]
-test = [
-    "pytest==9.1.1",
-    "pytest-asyncio==1.4.0",
-    "pytest-cov==7.1.0",
-]
-package = [
-    "build==1.5.0",
-    "setuptools==84.0.0",
-    "wheel==0.48.0",
-]
-docs = ["mkdocs-material==9.7.7"]
-
 [dependency-groups]
 resolver-bootstrap = [
     "pip==26.2.1",
     "setuptools==84.0.0",
     "pip-tools==7.6.1",
-    "build==1.5.0",
+    "build==1.6.0",
     "click==8.5.0",
     "packaging==26.3",
     "pyproject-hooks==1.2.0",

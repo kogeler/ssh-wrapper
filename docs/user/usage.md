@@ -56,11 +56,17 @@ executable wrapper when a consumer accepts only a path.
 These forms contain explicit barriers against new authentication and proxy
 fallback. If the master disappears, construct a new `OpenSSHMaster` only after
 your application deliberately decides to authenticate again.
+The remote-program string is interpreted by the remote shell. Quote individual
+application arguments with `shlex.join()` when constructing such a program;
+never interpolate untrusted text directly into shell syntax. The embedding
+application remains responsible for cancelling and reaping ordinary secondary
+subprocesses, including when its own task is cancelled.
 
 ## Own a long-lived remote child
 
 Use `OwnedRemoteProcess` only when the remote target provides `python3` and the
-child should remain tied to a heartbeat lease:
+POSIX process/session operations used by the supervisor, and the child should
+remain tied to a heartbeat lease (Linux loopback is covered by acceptance):
 
 ```python
 from ssh_wrapper import OpenSSHMaster, OwnedRemoteProcess
@@ -88,6 +94,10 @@ intentionally escapes that group.
 
 The default diagnostic tail is 16 KiB. If `tail_bytes` is customized, pass a
 positive integer so stdout and stderr retention stays bounded.
+Select positive finite timeouts and leave a margin between the heartbeat
+interval and lease. A cancelled or timed-out `wait()` does not end ownership;
+the `finally` block's `close()` does. Cleanup includes surviving members of the
+same process group even if its leader exits first.
 
 See the [API guide](api.md) and [security guide](security.md) for the ownership
 and diagnostic boundaries.

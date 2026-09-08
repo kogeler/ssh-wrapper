@@ -19,3 +19,6 @@ follow the [release procedure](docs/maintenance/releases.md).
 
 Do not hand-edit generated requirement locks. Keep `.version`, the matching
 dated `CHANGELOG.md` section, metadata, tests, and documentation synchronized.
+Ordinary PRs retain `.version` and add release-worthy notes under `Unreleased`.
+The PR metadata workflow mirrors that populated section while preserving manual
+body text. Advance the version only when deliberately preparing a release.

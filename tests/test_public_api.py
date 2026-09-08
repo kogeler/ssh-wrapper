@@ -135,6 +135,37 @@ def test_public_call_shapes_defaults_and_async_boundaries_are_stable() -> None:
         supervisor[name].kind is keyword_only and supervisor[name].default is empty
         for name in ("lease_timeout", "grace_timeout")
     )
+    for owner, methods in (
+        (
+            ssh_wrapper.OpenSSHMaster,
+            {
+                "start": {},
+                "ensure_ready": {},
+                "close": {},
+                "mux_transport_argv": {},
+                "mux_ssh_command": {},
+                "rsync_ssh_command": {},
+                "command_argv": {"remote_program": (positional, empty)},
+                "create_mux_wrapper": {"name": (positional, "mux-ssh")},
+            },
+        ),
+        (ssh_wrapper.OwnedRemoteProcess, {"start": {}, "wait": {}, "close": {}}),
+        (
+            ssh_wrapper.BoundedTail,
+            {
+                "append": {"chunk": (positional, empty)},
+                "clear": {},
+                "text": {},
+            },
+        ),
+        (ssh_wrapper.SSHError, {"to_dict": {}}),
+    ):
+        for method, expected in methods.items():
+            assert {
+                name: (parameter.kind, parameter.default)
+                for name, parameter in _parameters(getattr(owner, method)).items()
+                if name != "self"
+            } == expected
     assert (
         _parameters(ssh_wrapper.resolve_session_environment)["base_environment"].default
         is None

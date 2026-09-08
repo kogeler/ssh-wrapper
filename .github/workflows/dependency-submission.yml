@@ -8,6 +8,7 @@ on:
       - main
     paths:
       - pyproject.toml
+      - "requirements-*.in"
       - "requirements-*.txt"
       - Makefile
       - tools/dependency_policy.py

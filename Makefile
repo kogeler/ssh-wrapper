@@ -10,6 +10,10 @@ PY ?= python3
 SUPPORTED_PYTHONS := 3.13 3.14
 BIN := bin
 
+DEVELOPMENT_INPUT := requirements-dev.in
+TEST_INPUT := requirements-test.in
+PACKAGE_INPUT := requirements-package.in
+DOCS_INPUT := requirements-docs.in
 DEVELOPMENT_LOCK := requirements-dev.txt
 TEST_LOCK := requirements-test.txt
 PACKAGE_LOCK := requirements-package.txt
@@ -18,11 +22,15 @@ LOCKS := $(DEVELOPMENT_LOCK) $(TEST_LOCK) $(PACKAGE_LOCK) $(DOCS_LOCK)
 COMPILE := --quiet --strip-extras --allow-unsafe --generate-hashes
 LOCK_UPGRADE ?=
 
-VENV_DEV := .venv-dev
-VENV_DOCS := .venv-docs
-VENV_LOCK := .venv-lock
-VENV_PACKAGE := .venv-package
-VENV_TEST := .venv-test
+VENV_ROOT := $(shell $(PY) -I tools/machine.py)
+ifeq ($(VENV_ROOT),)
+$(error Cannot select machine-specific environments; check Python and /etc/machine-id)
+endif
+VENV_DEV := $(VENV_ROOT)/dev
+VENV_DOCS := $(VENV_ROOT)/docs
+VENV_LOCK := $(VENV_ROOT)/lock
+VENV_PACKAGE := $(VENV_ROOT)/package
+VENV_TEST := $(VENV_ROOT)/test
 PYTHON_DEV := $(VENV_DEV)/$(BIN)/python
 PYTHON_DOCS := $(VENV_DOCS)/$(BIN)/python
 PYTHON_LOCK := $(VENV_LOCK)/$(BIN)/python
@@ -44,18 +52,23 @@ RUFF_OUTPUT := $(if $(RUFF_OUTPUT_FORMAT),--output-format=$(RUFF_OUTPUT_FORMAT))
 PYTHON_SOURCES := ssh_wrapper tests tests_acceptance tools .github/scripts
 ACTIONLINT_IMAGE := docker.io/rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 CONTAINER ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+ACCEPTANCE_IMAGE_ID := $(VENV_ROOT)/acceptance-image.id
+ACCEPTANCE_DEBUG ?= 0
 
-.PHONY: help check-python check-lock-python venv-dev venv-test venv-package venv-docs venv-lock \
+.PHONY: help check-python check-lock-python venv-path venv-dev venv-test venv-package venv-docs venv-lock \
 	lock refresh-dependencies freeze-check lock-platform-check \
 	dependency-validate dependency-snapshot audit audit-raw outdated \
 	format format-check lint typecheck bandit syntax test test-full test-network-block \
 	version-check release-notes build checksums package confinement-test \
 	smoke-wheel smoke-sdist smoke reproducibility docs-build docs-audit docs-serve \
-	validate-actions test-acceptance quality policy check ci clean
+	validate-actions acceptance-image test-acceptance-support test-acceptance test-fido quality policy check ci clean
 
 help: ## list supported development targets
 	@grep -hE '^[a-zA-Z][a-zA-Z0-9_-]*:.*##' $(MAKEFILE_LIST) | \
 		awk -F':.*## ' '{printf "  %-24s %s\n", $$1, $$2}'
+
+venv-path: ## print the selected machine/user/interpreter environment root
+	@printf '%s\n' '$(VENV_ROOT)'
 
 check-python:
 	@command -v $(PY) >/dev/null 2>&1 || { \
@@ -120,27 +133,29 @@ venv-lock: $(DEPS_LOCK_STAMP) ## create the isolated exact resolver environment
 
 lock: venv-lock ## regenerate all four hash locks without upgrading direct pins
 	@CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-		$(COMPILE) $(LOCK_UPGRADE) --extra=dev --output-file=$(DEVELOPMENT_LOCK) pyproject.toml
+		$(COMPILE) $(LOCK_UPGRADE) --output-file=$(DEVELOPMENT_LOCK) $(DEVELOPMENT_INPUT)
 	@CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-		$(COMPILE) $(LOCK_UPGRADE) --extra=test --output-file=$(TEST_LOCK) pyproject.toml
+		$(COMPILE) $(LOCK_UPGRADE) --output-file=$(TEST_LOCK) $(TEST_INPUT)
 	@CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-		$(COMPILE) $(LOCK_UPGRADE) --extra=package --output-file=$(PACKAGE_LOCK) pyproject.toml
+		$(COMPILE) $(LOCK_UPGRADE) --output-file=$(PACKAGE_LOCK) $(PACKAGE_INPUT)
 	@CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-		$(COMPILE) $(LOCK_UPGRADE) --extra=docs --output-file=$(DOCS_LOCK) pyproject.toml
+		$(COMPILE) $(LOCK_UPGRADE) --output-file=$(DOCS_LOCK) $(DOCS_INPUT)
+	@$(MAKE) dependency-validate
 
 refresh-dependencies: ## upgrade transitive graphs after reviewed direct-pin changes
 	@$(MAKE) lock LOCK_UPGRADE=--upgrade
 
 freeze-check: venv-lock ## reject semantic pin or hash drift in every lock
 	@temporary="$$(mktemp -d)"; trap 'find "$$temporary" -depth -delete' EXIT; \
+		cp -- $(LOCKS) "$$temporary/"; \
 		CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-			$(COMPILE) --extra=dev --output-file="$$temporary/$(DEVELOPMENT_LOCK)" pyproject.toml; \
+			$(COMPILE) --output-file="$$temporary/$(DEVELOPMENT_LOCK)" $(DEVELOPMENT_INPUT); \
 		CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-			$(COMPILE) --extra=test --output-file="$$temporary/$(TEST_LOCK)" pyproject.toml; \
+			$(COMPILE) --output-file="$$temporary/$(TEST_LOCK)" $(TEST_INPUT); \
 		CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-			$(COMPILE) --extra=package --output-file="$$temporary/$(PACKAGE_LOCK)" pyproject.toml; \
+			$(COMPILE) --output-file="$$temporary/$(PACKAGE_LOCK)" $(PACKAGE_INPUT); \
 		CUSTOM_COMPILE_COMMAND='make lock' $(PYTHON_LOCK) -m piptools compile \
-			$(COMPILE) --extra=docs --output-file="$$temporary/$(DOCS_LOCK)" pyproject.toml; \
+			$(COMPILE) --output-file="$$temporary/$(DOCS_LOCK)" $(DOCS_INPUT); \
 		$(PY) tools/dependency_policy.py compare --candidate-root "$$temporary"
 
 lock-platform-check: venv-lock ## prove all locks resolve from supported Linux wheels
@@ -166,7 +181,7 @@ dependency-snapshot: ## build all GitHub dependency manifests offline
 audit: venv-dev ## require findings to equal the exact reviewed exception set
 	@$(PYTHON_DEV) tools/dependency_audit.py
 
-audit-raw: venv-dev ## print strict raw findings for locks and resolver bootstrap
+audit-raw: venv-dev dependency-validate ## print strict raw findings for locks and resolver bootstrap
 	@temporary="$$(mktemp)"; trap 'unlink "$$temporary"' EXIT; \
 		$(PY) tools/dependency_policy.py bootstrap > "$$temporary"; \
 		$(PYTHON_DEV) -m pip_audit --strict --disable-pip --require-hashes \
@@ -254,14 +269,35 @@ docs-audit: docs-build ## audit generated routes, links, anchors, and canonical 
 docs-serve: venv-docs ## serve documentation locally with live reload
 	@$(VENV_DOCS)/$(BIN)/mkdocs serve
 
+# Use the host service buses even when launched from a private application bus.
 validate-actions: ## lint workflows in an immutable networkless container
 	@test -n "$(CONTAINER)" || { printf '%s\n' 'Podman or Docker is required' >&2; exit 1; }
-	@$(CONTAINER) run --rm --network=none --read-only --cap-drop=all \
+	@env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_SYSTEM_BUS_ADDRESS \
+		$(CONTAINER) run --rm --network=none --read-only --cap-drop=all \
 		--security-opt=no-new-privileges --volume "$(CURDIR):/repo:ro,z" \
 		--workdir /repo $(ACTIONLINT_IMAGE) -config-file .github/actionlint.yaml
 
-test-acceptance: venv-test ## run hermetic real-OpenSSH acceptance on Linux
-	@$(PYTHON_TEST) -m pytest -q -m acceptance tests_acceptance
+acceptance-image: check-python ## build the isolated test-only SSH server image
+	@test -n "$(CONTAINER)" || { printf '%s\n' 'Podman or Docker is required' >&2; exit 1; }
+	@mkdir -p "$(VENV_ROOT)"
+	@env -u DBUS_SESSION_BUS_ADDRESS -u DBUS_SYSTEM_BUS_ADDRESS \
+		$(CONTAINER) build --file tests_acceptance/server/Containerfile \
+		--iidfile "$(ACCEPTANCE_IMAGE_ID)" tests_acceptance/server
+
+test-acceptance-support: venv-test ## test container-fixture policy without an engine or hardware
+	@$(PYTHON_TEST) tools/run_tests.py -q tests/test_acceptance_support.py
+
+test-acceptance: venv-test acceptance-image ## test the host client against a containerized SSH server
+	@SSH_WRAPPER_TEST_CONTAINER="$(CONTAINER)" \
+		SSH_WRAPPER_TEST_IMAGE="$$(< "$(ACCEPTANCE_IMAGE_ID)")" \
+		SSH_WRAPPER_TEST_DEBUG="$(ACCEPTANCE_DEBUG)" \
+		$(PYTHON_TEST) -m pytest -q -m acceptance tests_acceptance
+
+test-fido: venv-test acceptance-image ## test the host FIDO client against the same container server
+	@SSH_WRAPPER_TEST_CONTAINER="$(CONTAINER)" \
+		SSH_WRAPPER_TEST_IMAGE="$$(< "$(ACCEPTANCE_IMAGE_ID)")" \
+		SSH_WRAPPER_TEST_DEBUG="$(ACCEPTANCE_DEBUG)" \
+		$(PYTHON_TEST) -m pytest -q -s -m fido tests_acceptance
 
 quality: format-check lint typecheck bandit syntax version-check dependency-validate ## run static source and ownership gates
 
@@ -269,10 +305,10 @@ policy: freeze-check lock-platform-check dependency-snapshot validate-actions ##
 
 check: quality test test-network-block ## run source-quality and unit-test gates
 
-ci: quality test-full test-network-block policy docs-audit audit smoke reproducibility ## run each complete Linux gate exactly once
+ci: quality test-full test-network-block policy test-acceptance docs-audit audit smoke reproducibility ## run each complete Linux gate exactly once
 
 clean: ## remove only project-owned generated state
-	@for path in .venv "$(VENV_DEV)" "$(VENV_TEST)" "$(VENV_PACKAGE)" \
+	@for path in "$(VENV_DEV)" "$(VENV_TEST)" "$(VENV_PACKAGE)" \
 		"$(VENV_DOCS)" "$(VENV_LOCK)" .pytest_cache .ruff_cache .mypy_cache \
 		.artifacts build dist site coverage.xml .coverage htmlcov ssh_wrapper.egg-info; do \
 		if [[ -d "$$path" ]]; then find "$$path" -depth -delete; \

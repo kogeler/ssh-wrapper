@@ -12,7 +12,6 @@ import datetime as dt
 import hashlib
 import io
 import os
-import re
 import struct
 import sys
 import tarfile
@@ -25,12 +24,15 @@ from pathlib import Path, PurePosixPath
 
 if __package__:
     from .checksums import verify as verify_checksums
+    from .dependency_policy import PolicyError, read_input
 else:
     from checksums import verify as verify_checksums
+    from dependency_policy import PolicyError, read_input
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = {
     "__init__.py",
+    "_process.py",
     "bounded.py",
     "connection.py",
     "errors.py",
@@ -45,7 +47,6 @@ PROJECT_URLS = {
     "Issues, https://github.com/kogeler/ssh-wrapper/issues",
     "Changelog, https://github.com/kogeler/ssh-wrapper/blob/main/CHANGELOG.md",
 }
-EXTRAS = {"dev", "test", "package", "docs"}
 FORBIDDEN_BYTES = (
     b"remote-ssh-mcp-server",
     b"remote_ssh_mcp",
@@ -69,11 +70,6 @@ def safe_parts(name: str) -> tuple[str, ...]:
     ):
         raise DistributionError(f"unsafe archive member: {name}")
     return path.parts
-
-
-def _requirement_key(value: str) -> str:
-    """Normalize insignificant Core Metadata requirement whitespace."""
-    return re.sub(r"\s+", "", value)
 
 
 def _metadata(
@@ -113,28 +109,13 @@ def _metadata(
         raise DistributionError("source project classifiers are invalid")
     if message.get_all("Classifier", []) != classifiers:
         raise DistributionError("metadata classifiers differ from pyproject.toml")
-    if set(message.get_all("Provides-Extra", [])) != EXTRAS:
-        raise DistributionError("metadata optional dependency audiences differ")
-    optional = project.get("optional-dependencies")
-    if not isinstance(optional, dict) or set(optional) != EXTRAS:
-        raise DistributionError("source optional dependency audiences are invalid")
-    expected_requirements: list[str] = []
-    for extra, requirements in optional.items():
-        if (
-            not isinstance(extra, str)
-            or not isinstance(requirements, list)
-            or not all(isinstance(requirement, str) for requirement in requirements)
-        ):
-            raise DistributionError("source optional dependencies are invalid")
-        expected_requirements.extend(
-            f'{requirement}; extra == "{extra}"' for requirement in requirements
-        )
-    actual_requirements = message.get_all("Requires-Dist", [])
-    if len(actual_requirements) != len(expected_requirements) or {
-        _requirement_key(requirement) for requirement in actual_requirements
-    } != {_requirement_key(requirement) for requirement in expected_requirements}:
+    if project.get("dependencies") != [] or "optional-dependencies" in project:
         raise DistributionError(
-            "metadata requirements differ from exact maintainer audiences"
+            "source metadata must have no runtime or maintainer dependencies"
+        )
+    if message.get_all("Requires-Dist", []) or message.get_all("Provides-Extra", []):
+        raise DistributionError(
+            "metadata must not publish runtime dependencies or maintainer extras"
         )
     if message.get_all("Dynamic", []) != ["license-file"]:
         raise DistributionError("metadata dynamic field inventory differs")
@@ -207,18 +188,7 @@ def verify_wheel(path: Path, *, root: Path, version: str, epoch: int) -> None:
             raise DistributionError("py.typed must remain an empty marker")
         if archive.read(f"{dist_info}/top_level.txt") != b"ssh_wrapper\n":
             raise DistributionError("wheel top_level.txt differs")
-        build_requirements = project_document.get("build-system", {}).get("requires")
-        if not isinstance(build_requirements, list):
-            raise DistributionError("source build-system requirements are invalid")
-        setuptools = next(
-            (
-                requirement.partition("==")[2]
-                for requirement in build_requirements
-                if isinstance(requirement, str)
-                and requirement.startswith("setuptools==")
-            ),
-            None,
-        )
+        setuptools = read_input(root / "requirements-package.in").get("setuptools")
         expected_wheel_metadata = (
             "Wheel-Version: 1.0\n"
             f"Generator: setuptools ({setuptools})\n"
@@ -262,7 +232,6 @@ def verify_sdist(path: Path, *, root: Path, version: str, epoch: int) -> None:
         "ssh_wrapper.egg-info/PKG-INFO",
         "ssh_wrapper.egg-info/SOURCES.txt",
         "ssh_wrapper.egg-info/dependency_links.txt",
-        "ssh_wrapper.egg-info/requires.txt",
         "ssh_wrapper.egg-info/top_level.txt",
     }
     expected_files = {
@@ -375,24 +344,6 @@ def verify_sdist(path: Path, *, root: Path, version: str, epoch: int) -> None:
         project = project_document.get("project")
         if not isinstance(project, dict):
             raise DistributionError("sdist project metadata is missing")
-        optional = project.get("optional-dependencies")
-        if not isinstance(optional, dict) or set(optional) != EXTRAS:
-            raise DistributionError("sdist optional dependency audiences are invalid")
-        sections: list[str] = []
-        for extra in sorted(optional):
-            requirements = optional[extra]
-            if not isinstance(requirements, list) or not all(
-                isinstance(requirement, str) for requirement in requirements
-            ):
-                raise DistributionError("sdist optional dependencies are invalid")
-            sections.append(f"[{extra}]\n" + "\n".join(requirements))
-        expected_requires = "\n" + "\n\n".join(sections) + "\n"
-        if (
-            files["ssh_wrapper.egg-info/requires.txt"].decode("utf-8")
-            != expected_requires
-        ):
-            raise DistributionError("sdist requires.txt differs from pyproject.toml")
-
         readme = (root / "README.md").read_text(encoding="utf-8")
         _metadata(files["PKG-INFO"], version=version, readme=readme, project=project)
 
@@ -433,7 +384,13 @@ def main() -> int:
             root=arguments.root.resolve(),
             epoch=arguments.epoch,
         )
-    except (OSError, tarfile.TarError, zipfile.BadZipFile, DistributionError) as error:
+    except (
+        OSError,
+        tarfile.TarError,
+        zipfile.BadZipFile,
+        PolicyError,
+        DistributionError,
+    ) as error:
         print(f"distribution error: {error}", file=sys.stderr)
         return 1
     print(f"Verified {wheel.name} and {sdist.name}")

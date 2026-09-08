@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from tools import dependency_audit
+from tools import dependency_audit, dependency_policy
 
 ROOT = Path(__file__).resolve().parents[1]
 POLICY = ROOT / "tools/dependency_policy.py"
@@ -43,6 +43,8 @@ def copy_inputs(destination: Path) -> None:
     shutil.copy2(ROOT / "pyproject.toml", destination / "pyproject.toml")
     for name in LOCKS:
         shutil.copy2(ROOT / name, destination / name)
+        input_path = Path(name).with_suffix(".in")
+        shutil.copy2(ROOT / input_path, destination / input_path)
 
 
 def test_direct_dependencies_are_exact_and_scoped() -> None:
@@ -50,7 +52,18 @@ def test_direct_dependencies_are_exact_and_scoped() -> None:
     project = document["project"]
 
     assert project["dependencies"] == []
-    groups = project["optional-dependencies"]
+    assert "optional-dependencies" not in project
+    groups = {
+        audience: [
+            line
+            for line in (ROOT / lock)
+            .with_suffix(".in")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line and not line.startswith("#")
+        ]
+        for audience, lock in dependency_policy.LOCK_DEFINITIONS
+    }
     assert set(groups) == {"dev", "test", "package", "docs"}
     assert all(
         group and all(EXACT.fullmatch(item) for item in group)
@@ -79,17 +92,17 @@ def test_direct_dependencies_are_exact_and_scoped() -> None:
 
     bootstrap = document["dependency-groups"]["resolver-bootstrap"]
     assert bootstrap and all(EXACT.fullmatch(item) for item in bootstrap)
-    assert document["build-system"]["requires"] == [
-        requirement
-        for requirement in groups["package"]
-        if requirement.startswith("setuptools==")
-    ]
+    assert document["build-system"]["requires"] == ["setuptools>=84"]
     completed = run(POLICY, "bootstrap")
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.splitlines() == [
         requirement.partition("[")[0] if "[" in requirement else requirement
         for requirement in bootstrap
     ]
+    assert dependency_policy.validate_resolver_bootstrap(ROOT) == {
+        requirement.partition("==")[0]: requirement.partition("==")[2]
+        for requirement in bootstrap
+    }
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     assert "LOCK_BOOTSTRAP" not in makefile
     assert "tools/dependency_policy.py bootstrap" in makefile
@@ -97,6 +110,100 @@ def test_direct_dependencies_are_exact_and_scoped() -> None:
         "venv-lock:", 1
     )[0]
     assert "--no-deps --only-binary=:all:" in bootstrap_recipe
+    assert "--extra=" not in makefile
+    freeze_recipe = makefile.split("freeze-check:", 1)[1].split(
+        "lock-platform-check:", 1
+    )[0]
+    assert 'cp -- $(LOCKS) "$$temporary/"' in freeze_recipe
+    lock_recipe = makefile.split("\nlock:", 1)[1].split("\nrefresh-dependencies:", 1)[0]
+    assert lock_recipe.rstrip().endswith("@$(MAKE) dependency-validate")
+
+
+@pytest.mark.parametrize("lock_state", ("stale", "missing"))
+def test_resolver_bootstrap_is_available_before_lock_regeneration(
+    tmp_path: Path, lock_state: str
+) -> None:
+    copy_inputs(tmp_path)
+    project = tmp_path / "pyproject.toml"
+    bootstrap = dependency_policy.resolver_bootstrap(tmp_path)
+    project.write_text(
+        project.read_text(encoding="utf-8").replace(
+            f'"build=={bootstrap["build"]}"', '"build==0.0.1"'
+        ),
+        encoding="utf-8",
+    )
+    bootstrap["build"] = "0.0.1"
+    if lock_state == "missing":
+        for name in LOCKS:
+            (tmp_path / name).unlink()
+
+    completed = run(POLICY, "--root", tmp_path, "bootstrap")
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        f"{name}=={version}" for name, version in bootstrap.items()
+    ]
+
+    rejected = run(POLICY, "--root", tmp_path, "validate")
+    assert rejected.returncode == 1
+    assert (
+        "resolver bootstrap versions differ from audience locks"
+        if lock_state == "stale"
+        else "cannot read"
+    ) in rejected.stderr
+
+
+@pytest.mark.parametrize(
+    "requirement", ("build>=1", "build==1.*", "unexpected==1", "pip==1")
+)
+def test_resolver_bootstrap_rejects_invalid_source_without_locks(
+    tmp_path: Path, requirement: str
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    bootstrap = dependency_policy.resolver_bootstrap(ROOT)
+    project.write_text(
+        (ROOT / "pyproject.toml")
+        .read_text(encoding="utf-8")
+        .replace(f'"build=={bootstrap["build"]}"', f'"{requirement}"'),
+        encoding="utf-8",
+    )
+    completed = run(POLICY, "--root", tmp_path, "bootstrap")
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert "dependency policy error" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        "",
+        "ruff>=1",
+        "ruff==1.*",
+        "-r requirements.in",
+        "ruff==1; python_version >= '3'",
+        "ruff==1\nRuff==1",
+    ),
+)
+def test_native_inputs_reject_nonexact_or_ambiguous_requirements(
+    tmp_path: Path, content: str
+) -> None:
+    copy_inputs(tmp_path)
+    (tmp_path / "requirements-dev.in").write_text(content, encoding="utf-8")
+    completed = run(POLICY, "--root", tmp_path, "validate")
+    assert completed.returncode == 1
+
+
+def test_native_inputs_reject_duplicate_owners_and_extra_audiences(
+    tmp_path: Path,
+) -> None:
+    copy_inputs(tmp_path)
+    development = tmp_path / "requirements-dev.in"
+    development.write_text("pytest==9.1.1\n", encoding="utf-8")
+    completed = run(POLICY, "--root", tmp_path, "validate")
+    assert completed.returncode == 1 and "must be disjoint" in completed.stderr
+    shutil.copy2(ROOT / "requirements-dev.in", development)
+    (tmp_path / "requirements.in").write_text("example==1\n", encoding="utf-8")
+    completed = run(POLICY, "--root", tmp_path, "validate")
+    assert completed.returncode == 1 and "exactly four" in completed.stderr
 
 
 def test_all_committed_locks_are_nonempty_pip_compile_hash_locks() -> None:
@@ -166,9 +273,10 @@ def test_snapshot_rejects_hashless_and_version_drifted_inputs(tmp_path: Path) ->
     assert "has no SHA-256 hash" in hashless.stderr
 
     shutil.copy2(ROOT / "requirements-dev.txt", lock)
-    project = (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
-    (tmp_path / "pyproject.toml").write_text(
-        re.sub(r'"ruff==[^"\n]+"', '"ruff==0.0.1"', project), encoding="utf-8"
+    source = tmp_path / "requirements-dev.in"
+    source.write_text(
+        re.sub(r"ruff==[^\n]+", "ruff==0.0.1", source.read_text(encoding="utf-8")),
+        encoding="utf-8",
     )
     drift = run(SNAPSHOT, "--root", tmp_path, "--output", tmp_path / "snapshot.json")
     assert drift.returncode == 1
@@ -274,4 +382,5 @@ def test_live_audit_includes_locks_and_exact_resolver_bootstrap(
 
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     assert "tools/dependency_policy.py bootstrap" in makefile
+    assert "audit-raw: venv-dev dependency-validate" in makefile
     assert "--disable-pip --no-deps" in makefile

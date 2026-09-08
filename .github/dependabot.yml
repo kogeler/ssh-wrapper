@@ -1,5 +1,6 @@
 version: 2
 updates:
+  # Native .in/.txt pairs let Dependabot update complete pip-compile graphs.
   - package-ecosystem: pip
     directory: /
     schedule:
@@ -8,6 +9,8 @@ updates:
       time: "05:00"
       timezone: Etc/UTC
     open-pull-requests-limit: 5
+    exclude-paths:
+      - pyproject.toml
     groups:
       python:
         patterns:

@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import shlex
+import signal
 import sys
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -42,7 +46,10 @@ import sys
 import time
 from pathlib import Path
 
-if sys.argv[1:] != ["--user", "show-environment"]:
+expected = ["--user", "show-environment"]
+if os.environ.get("FAKE_SYSTEMCTL_JSON"):
+    expected.append("--output=json")
+if sys.argv[1:] != expected:
     raise SystemExit(92)
 if os.environ.get("FAKE_SYSTEMCTL_RECORD"):
     Path(os.environ["FAKE_SYSTEMCTL_RECORD"]).write_text(
@@ -323,3 +330,102 @@ async def test_non_linux_environment_is_a_noop(
     )
 
     assert await session_environment.resolve_session_environment(inherited) == inherited
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("json_output", (False, True))
+async def test_session_paths_are_decoded_as_data_without_shell_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_output: bool
+) -> None:
+    install_probes(tmp_path, monkeypatch)
+    runtime = tmp_path / "runtime with spaces"
+    runtime.mkdir()
+    values = {
+        "XDG_RUNTIME_DIR": str(runtime),
+        "SSH_ASKPASS": "/trusted path/a'quoted\\askpass",
+        "SSH_AUTH_SOCK": "/session/$(literal);agent socket",
+        "DISPLAY": ":5",
+    }
+    output = (
+        json.dumps(values)
+        if json_output
+        else "\n".join(f"{name}={shlex.quote(value)}" for name, value in values.items())
+    ).encode()
+    inherited = probe_environment(tmp_path, str(runtime), output)
+    if json_output:
+        inherited["FAKE_SYSTEMCTL_JSON"] = "1"
+    result = await session_environment.resolve_session_environment(inherited)
+    assert {name: result[name] for name in values} == values
+
+
+@pytest.mark.asyncio
+async def test_recovered_runtime_is_validated_not_only_the_probe_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_probes(tmp_path, monkeypatch)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    inherited = probe_environment(
+        tmp_path, str(runtime), b"XDG_RUNTIME_DIR=relative/unsafe\nDISPLAY=:7\n"
+    )
+    result = await session_environment.resolve_session_environment(inherited)
+    assert "XDG_RUNTIME_DIR" not in result
+    assert result["DISPLAY"] == ":7"
+
+
+def test_malformed_json_environment_is_ignored() -> None:
+    for output in (b"null", b"[]", b"{broken", b'{"SSH_ASKPASS": "\\ud800"}'):
+        assert (
+            session_environment._parse_systemd_environment(
+                session_environment._BoundedProbeOutput(output, False), json_output=True
+            )
+            == {}
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", (False, True))
+async def test_probe_cleanup_kills_descendants_after_the_probe_leader_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    program = tmp_path / "orphaning-probe"
+    leader = tmp_path / "leader.pid"
+    descendant = tmp_path / "descendant.pid"
+    child_program = (
+        "import os, pathlib, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"pathlib.Path({str(descendant)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    write_executable(
+        program,
+        "#!__PYTHON__\nimport os, pathlib, subprocess, sys, time\n"
+        f"pathlib.Path({str(leader)!r}).write_text(str(os.getpid()))\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_program!r}])\n"
+        f"while not pathlib.Path({str(descendant)!r}).exists(): time.sleep(0.01)\n",
+    )
+    monkeypatch.setattr(session_environment, "PROBE_TIMEOUT", 0.2)
+    monkeypatch.setattr(session_environment, "PROBE_STOP_TIMEOUT", 0.1)
+    task = asyncio.create_task(session_environment._run_probe(program, (), os.environ))
+    try:
+        async with asyncio.timeout(1):
+            while not descendant.exists():
+                await asyncio.sleep(0.01)
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await asyncio.wait_for(task, timeout=1) is None
+        pid = int(descendant.read_text())
+        proc = Path(f"/proc/{pid}/stat")
+        async with asyncio.timeout(1):
+            while (
+                proc.exists() and proc.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+            ):
+                await asyncio.sleep(0.01)
+    finally:
+        if leader.exists():
+            with suppress(ProcessLookupError):
+                os.killpg(int(leader.read_text()), signal.SIGKILL)
+        await asyncio.gather(task, return_exceptions=True)

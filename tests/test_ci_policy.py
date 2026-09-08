@@ -94,9 +94,6 @@ def test_ci_preserves_quality_python_package_and_openssh_gates() -> None:
         "make package smoke reproducibility PY=python",
         "make test-acceptance PY=python",
         "make audit PY=python",
-        "openssh-server=${client_version}",
-        'test "$server_version" = "$client_version"',
-        "command -v sshd",
         "actions/dependency-review-action@",
         "github/codeql-action/init@",
         "github/codeql-action/analyze@",
@@ -104,6 +101,7 @@ def test_ci_preserves_quality_python_package_and_openssh_gates() -> None:
     ):
         assert relationship in ci
     assert "make ci PY=python" not in ci
+    assert "openssh-server=" not in ci and "command -v sshd" not in ci
     assert "push:\n    branches:\n      - main" not in ci
     assert "windows-" not in ci and "macos-" not in ci
 
@@ -181,6 +179,8 @@ def test_version_job_compares_exact_base_and_head() -> None:
     assert 'ZERO_SHA: "0000000000000000000000000000000000000000"' in ci
     assert 'base_version="0.0.0"' in ci
     assert "unpublished_base_version" in ci
+    assert "published_current_version" in ci
+    assert 'elif [[ "$PUBLISHED_CURRENT_VERSION" != "true" ]]' in ci
     assert 'VERSION_ARGS="$args"' in ci
 
 
@@ -200,6 +200,14 @@ def test_release_reuses_ci_and_shared_python_distributions() -> None:
     )
     assert "compression-level: 0" in ci
     assert "retention-days: 1" in ci
+    release_ci = release.split("\n  ci:", 1)[1].split("\n  publish-pypi:", 1)[0]
+    assert "needs: release-state" in release_ci
+    assert "if: needs.release-state.outputs.release_required == 'true'" in release_ci
+    assert "release_required: ${{ steps.check.outputs.release_required }}" in release
+    assert 'core.setOutput("release_required", String(releaseRequired))' in release
+    assert "const releaseCommit = published ? tagCommit : context.sha;" in release
+    assert 'read("CHANGELOG.md", releaseCommit)' in release
+    assert "paths:" not in release.split("\npermissions:", 1)[0]
 
 
 def test_release_state_is_exact_and_recovery_is_non_destructive() -> None:
@@ -230,6 +238,7 @@ def test_dependency_submission_is_trusted_main_only() -> None:
     assert "push:" in workflow
     assert "pull_request" not in workflow and "workflow_dispatch" not in workflow
     assert '      - "requirements-*.txt"' in workflow
+    assert '      - "requirements-*.in"' in workflow
     assert "      - pyproject.toml" in workflow
     assert 'context.ref !== "refs/heads/main"' in workflow
     assert "EXPECTED_REPOSITORY: kogeler/ssh-wrapper" in workflow
@@ -245,6 +254,7 @@ def test_pages_validates_prs_and_confines_publish_permissions() -> None:
 
     assert "pull_request:" in pages and "push:" in pages
     assert '      - "docs/**"' in pages
+    assert pages.count('      - "requirements-docs.in"') == 2
     assert "make docs-audit PY=python" in pages
     assert pages.count("pages: write") == 1
     assert pages.count("id-token: write") == 1

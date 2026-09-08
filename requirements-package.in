@@ -1,0 +1,4 @@
+# Exact direct distribution tools; regenerate requirements-package.txt with make lock.
+build==1.6.0
+setuptools==84.0.0
+wheel==0.48.0

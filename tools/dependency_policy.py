@@ -1,7 +1,7 @@
 # Copyright (c) 2026 kogeler
 # SPDX-License-Identifier: MIT
 
-"""Validate the four exact hash locks owned by root PEP 621 metadata."""
+"""Validate four native pip-compile input/lock pairs and the isolated resolver."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;\\]+)\s+\\$")
 HASH = re.compile(r"^--hash=sha256:([0-9a-f]{64})(?:\s+\\)?$")
 DIRECT = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9._-]*)"
-    r"(?:\[[A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*\])?==([^\s;]+)$"
+    r"(?:\[[A-Za-z0-9._-]+(?:,[A-Za-z0-9._-]+)*\])?==([0-9][A-Za-z0-9.!+_-]*)$"
 )
 
 
@@ -180,6 +180,22 @@ def read_lock(path: Path) -> dict[str, str]:
     return pins
 
 
+def read_input(path: Path) -> dict[str, str]:
+    """Read a non-empty audience input containing only exact pins and comments."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise PolicyError(f"cannot read {path}: {error}") from error
+    return direct_requirements(
+        [
+            line.strip()
+            for line in lines
+            if line.strip() and not line.lstrip().startswith("#")
+        ],
+        source=str(path),
+    )
+
+
 def lock_body(path: Path) -> str:
     """Return lock content without the interpreter-dependent generated header."""
     try:
@@ -197,18 +213,16 @@ def dependency_owners(root: Path) -> dict[str, tuple[dict[str, str], str]]:
     project = project_table(root / "pyproject.toml")
     if project.get("dependencies") != []:
         raise PolicyError("pyproject.toml: the runtime dependency array must be empty")
-    optional = project.get("optional-dependencies")
-    expected_groups = {group for group, _filename in LOCK_DEFINITIONS}
-    if not isinstance(optional, dict) or set(optional) != expected_groups:
+    if "optional-dependencies" in project:
         raise PolicyError(
-            "pyproject.toml: expected exactly the dev, test, package, and docs groups"
+            "pyproject.toml: maintainer audiences must be owned only by requirements-*.in"
         )
+    expected_inputs = {Path(filename).with_suffix(".in").name for filename in LOCKS}
+    if {path.name for path in root.glob("requirements*.in")} != expected_inputs:
+        raise PolicyError("expected exactly four native audience requirements inputs")
     direct_by_group = {
-        group: direct_requirements(
-            optional[group],
-            source=f"pyproject.toml [project.optional-dependencies].{group}",
-        )
-        for group in expected_groups
+        group: read_input((root / filename).with_suffix(".in"))
+        for group, filename in LOCK_DEFINITIONS
     }
 
     memberships: dict[str, list[tuple[str, str]]] = {}
@@ -291,7 +305,7 @@ def run(arguments: argparse.Namespace) -> None:
         print("Regenerated dependency pins and hashes match")
         return
     if arguments.command == "bootstrap":
-        for name, version in validate_resolver_bootstrap(root).items():
+        for name, version in resolver_bootstrap(root).items():
             print(f"{name}=={version}")
         return
     manifests = build_manifests(root)

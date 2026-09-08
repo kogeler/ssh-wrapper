@@ -45,24 +45,32 @@ write contents. Each exception MUST be confined to its owning job.
 **Contract:** PR-body automation MUST be the only `pull_request_target`
 boundary, run only for pull requests that change `CHANGELOG.md`, execute only
 trusted default-branch code, read a bounded head changelog through the API as
-inert data, preserve manual body text, and refuse concurrent overwrite.
+inert data, preserve manual body text, and refuse concurrent overwrite. It MUST
+select the newest populated level-two section, including `Unreleased` without
+a version change, and reject malformed or reserved managed markers.
 
 **Evidence:**
 
 - [`test_pr_body_is_only_pull_request_target_boundary`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_pr_body_is_only_pull_request_target_boundary`
 - [`test_pr_body_preserves_manual_text_and_replaces_only_managed_content`](../../tests/test_release_helpers.py) - `tests/test_release_helpers.py::test_pr_body_preserves_manual_text_and_replaces_only_managed_content`
+- [`test_pr_body_prefers_populated_unreleased_without_a_version_change`](../../tests/test_release_helpers.py) - `tests/test_release_helpers.py::test_pr_body_prefers_populated_unreleased_without_a_version_change`
+- [`test_pr_body_rejects_malformed_markers_and_empty_notes`](../../tests/test_release_helpers.py) - `tests/test_release_helpers.py::test_pr_body_rejects_malformed_markers_and_empty_notes`
 
 ### `CIR-005` - Version progression compares exact base and head
 
 **Contract:** Pull requests and later main pushes MUST compare the exact base
 and proposed `.version` values. The first repository commit MAY compare against
-`0.0.0`. Same-version recovery MAY occur only for an unpublished version newer
-than the latest stable release.
+`0.0.0`. Ordinary maintenance MAY retain an already published stable version
+while `Unreleased` accumulates. A changed version MUST advance beyond the exact
+base. Same-version unpublished recovery MUST advance beyond the latest stable
+release; drafts and prereleases MUST NOT count as published stable versions.
 
 **Evidence:**
 
 - [`test_version_job_compares_exact_base_and_head`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_version_job_compares_exact_base_and_head`
 - [`test_unpublished_recovery_and_exact_notes`](../../tests/test_release_governance.py) - `tests/test_release_governance.py::test_unpublished_recovery_and_exact_notes`
+- [`test_ci_only_treats_stable_published_versions_as_maintenance`](../../tests/test_release_workflow.py) - `tests/test_release_workflow.py::test_ci_only_treats_stable_published_versions_as_maintenance`
+- [`test_ci_passes_version_checks_the_exact_progression_arguments`](../../tests/test_release_workflow.py) - `tests/test_release_workflow.py::test_ci_passes_version_checks_the_exact_progression_arguments`
 
 ### `CIR-006` - Publication builds once and never replaces conflict
 
@@ -74,10 +82,20 @@ and GitHub. Published or draft tags, targets, notes, metadata, asset names,
 sizes, and hashes MUST be verified; conflict MUST fail without moving tags,
 deleting assets, or overwriting files.
 
+Every direct-main push MUST first inspect both publication targets. An exact
+complete published release MUST skip reusable release CI and both publication
+jobs, even when main has advanced. Published version, notes, and target metadata
+MUST be validated against the immutable tagged source; draft recovery MUST
+remain tied to the current release commit. Missing tags and incomplete or
+conflicting publication state MUST fail closed.
+
 **Evidence:**
 
 - [`test_release_reuses_ci_and_shared_python_distributions`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_release_reuses_ci_and_shared_python_distributions`
 - [`test_release_state_is_exact_and_recovery_is_non_destructive`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_release_state_is_exact_and_recovery_is_non_destructive`
+- [`test_published_release_uses_tagged_source_and_needs_no_work`](../../tests/test_release_workflow.py) - `tests/test_release_workflow.py::test_published_release_uses_tagged_source_and_needs_no_work`
+- [`test_unfinished_publication_requires_ci_and_only_missing_targets`](../../tests/test_release_workflow.py) - `tests/test_release_workflow.py::test_unfinished_publication_requires_ci_and_only_missing_targets`
+- [`test_publication_conflicts_fail_before_enabling_release`](../../tests/test_release_workflow.py) - `tests/test_release_workflow.py::test_publication_conflicts_fail_before_enabling_release`
 
 ### `CIR-007` - Dependency submission is trusted-main-only
 
@@ -152,12 +170,51 @@ without duplicating unrelated mutable literals.
 
 ### `CIR-013` - Automation is scoped to a Python library
 
-**Contract:** CI and release automation MUST create only the standard pure
-Python wheel and source distribution. It MUST NOT contain standalone
-application, native executable, container-image, Node application, or Rust
-build processes. Quality, tests, distributions, and OpenSSH acceptance MUST
-each have one workflow owner, and publication MUST not rebuild CI artifacts.
+**Contract:** CI and release automation MUST build distributable products only
+as the standard pure Python wheel and source distribution. It MUST NOT contain standalone
+application, native executable, application-container, Node application, or Rust
+build processes. A local test-only SSH server image MAY be built by the owning
+acceptance Make target, MUST NOT be published, and MUST remain outside Python
+distributions. Quality, tests, distributions, and OpenSSH acceptance MUST each
+have one workflow owner, and publication MUST not rebuild CI artifacts.
 
 **Evidence:**
 
 - [`test_ci_has_one_owner_per_library_gate_and_no_application_builds`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_ci_has_one_owner_per_library_gate_and_no_application_builds`
+
+### `CIR-014` - Local and CI container validation share one Make boundary
+
+**Contract:** Local and hosted workflow validation MUST invoke the same
+`make validate-actions` contract, also included by `make policy` and `make ci`.
+The container engine subprocess MUST receive neither `DBUS_SESSION_BUS_ADDRESS`
+nor `DBUS_SYSTEM_BUS_ADDRESS` from the caller, so private application buses
+cannot redirect access to host services. `XDG_RUNTIME_DIR` and the caller's
+environment MUST remain intact. Native cgroup and event backends MUST NOT be
+replaced to mask a failure. The target MUST retain its immutable image,
+network isolation, read-only root and repository mount, dropped capabilities,
+and no-new-privileges policy, and MUST propagate engine failure without retrying
+under weaker settings. Ad-hoc engine overrides and direct tool commands MUST
+NOT substitute for passing the maintained Make targets.
+The acceptance image build and all acceptance engine operations MUST apply
+the same D-Bus-only environment cleanup without altering native client prompt
+routing or selecting alternate engine backends. Both live gates MUST prepare
+their server through `make acceptance-image`; `make ci` MUST include ordinary
+container-backed acceptance exactly once and MUST exclude hardware interaction.
+Live networking MUST be selected from engine metadata by the shared fixture:
+direct `pasta` for rootless Podman, native bridge for Docker. This selection
+MUST NOT depend on whether the caller is CI or local, or on the engine's
+executable filename. No network or AppArmor fallback MAY mask teardown errors.
+The optional Make setting `ACCEPTANCE_DEBUG=1` MAY add engine debug logging and
+bounded stderr output only; it MUST NOT alter network or security arguments.
+
+**Evidence:**
+
+- [`test_container_validation_uses_host_buses_and_propagates_failure`](../../tests/test_project_policy.py) - `tests/test_project_policy.py::test_container_validation_uses_host_buses_and_propagates_failure`
+- [`test_make_exposes_every_governance_boundary`](../../tests/test_project_policy.py) - `tests/test_project_policy.py::test_make_exposes_every_governance_boundary`
+- [`test_ci_preserves_quality_python_package_and_openssh_gates`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_ci_preserves_quality_python_package_and_openssh_gates`
+- [`test_make_server_build_sanitizes_only_engine_buses_and_propagates_failure`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_make_server_build_sanitizes_only_engine_buses_and_propagates_failure`
+- [`test_make_and_ci_share_the_pinned_server_without_host_sshd`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_make_and_ci_share_the_pinned_server_without_host_sshd`
+- [`test_live_network_is_selected_from_engine_info`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_live_network_is_selected_from_engine_info`
+- [`test_podman_pasta_avoids_the_shared_rootless_bridge_cleanup`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_podman_pasta_avoids_the_shared_rootless_bridge_cleanup`
+- [`test_make_debug_option_changes_only_engine_logging`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_make_debug_option_changes_only_engine_logging`
+- [`test_invalid_debug_option_fails_without_an_engine_call`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_invalid_debug_option_fails_without_an_engine_call`

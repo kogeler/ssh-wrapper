@@ -15,6 +15,8 @@ Its control socket is placed in a newly created mode-`0700` directory.
 Secondary vectors disable new authentication, forwarding, agent sharing, X11,
 configured local commands, configured remote commands, and proxy fallback.
 Master loss is terminal for that object.
+Configured backgrounding and tunnel forwarding are disabled as well; supervised
+mux channels keep their ownership stdin open regardless of `StdinNull` defaults.
 
 ## Linux session recovery
 
@@ -37,18 +39,27 @@ Inherited non-empty values win. The recovered runtime directory is accepted
 only when it is absolute, exists, and belongs to the current UID. Recovered
 values go only to the initial master subprocess and never mutate `os.environ`.
 Non-Linux platforms and unavailable probes simply retain the inherited copy.
+The session environment is requested as JSON when supported, with a safe
+POSIX-quoted fallback for older systemd versions. Values are decoded as data,
+never evaluated by a shell. A recovered `XDG_RUNTIME_DIR` is checked separately
+from the runtime path used to reach the user manager.
 
 ## Diagnostics and remote cleanup
 
 Master stderr is drained continuously into bounded memory. Known interactive
-prompt failures receive a stable message; other failures expose only an exit
-status. Raw stderr, control paths, executable arguments, and identity paths do
+prompt failures receive a stable message; other process exits expose only an
+exit status. Startup resource errors use a generic path-free message. Raw stderr,
+control paths, executable arguments, and identity paths do
 not enter public master errors.
 
 Remote stdout and stderr evidence is also bounded, but applications still need
 to decide whether it is safe to display. The remote supervisor terminates only
 the process group it created. It cannot clean a daemon that deliberately
 escapes that group or a process blocked by kernel state.
+Cancellation of startup or closure waits for owned cleanup before propagating.
+A cancelled readiness check reaps its own helper without closing a healthy
+master; a cancelled remote `wait()` likewise does not implicitly release
+ownership. Close owners explicitly in `finally` blocks.
 
 Report suspected vulnerabilities privately through the repository's GitHub
 security advisory interface. Do not include credentials, identity files, or
