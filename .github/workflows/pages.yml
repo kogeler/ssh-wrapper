@@ -10,6 +10,7 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "pyproject.toml"
+      - "requirements-docs.in"
       - "requirements-docs.txt"
       - "tools/audit_docs_site.py"
       - "tests/test_documentation_contracts.py"
@@ -23,6 +24,7 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - "pyproject.toml"
+      - "requirements-docs.in"
       - "requirements-docs.txt"
       - "tools/audit_docs_site.py"
       - "tests/test_documentation_contracts.py"
@@ -84,4 +86,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
-

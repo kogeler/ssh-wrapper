@@ -17,9 +17,20 @@ class BoundedTail:
     limit: int = DEFAULT_TAIL_BYTES
     data: bytes = b""
 
+    def __post_init__(self) -> None:
+        if type(self.limit) is not int or self.limit <= 0:
+            raise ValueError("tail limit must be a positive integer")
+        if len(self.data) > self.limit:
+            raise ValueError("initial tail data exceeds its limit")
+
     def append(self, chunk: bytes) -> None:
         """Append bytes while retaining only the configured tail."""
-        self.data = (self.data + chunk)[-self.limit :]
+        if type(self.limit) is not int or self.limit <= 0:
+            raise ValueError("tail limit must be a positive integer")
+        if len(chunk) >= self.limit:
+            self.data = chunk[-self.limit :]
+        else:
+            self.data = (self.data + chunk)[-self.limit :]
 
     def clear(self) -> None:
         """Discard all retained diagnostics."""

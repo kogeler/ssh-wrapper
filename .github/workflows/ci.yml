@@ -147,22 +147,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-test.txt
 
-      - name: Provision the matching OpenSSH server fixture
-        run: |
-          client_version="$(dpkg-query --show --showformat='${Version}' openssh-client)"
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            "openssh-server=${client_version}"
-          server_version="$(dpkg-query --show --showformat='${Version}' openssh-server)"
-          test "$server_version" = "$client_version"
-
-      - name: Verify OpenSSH commands
-        run: |
-          command -v ssh
-          command -v sshd
-          command -v ssh-keygen
-
-      - name: Run isolated loopback acceptance
+      - name: Run native-client acceptance with the isolated container server
         run: make test-acceptance PY=python
 
   dependency-review:
@@ -255,7 +240,7 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Resolve unpublished-version recovery baseline
+      - name: Resolve published maintenance or unpublished recovery baseline
         id: baseline
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
@@ -267,12 +252,19 @@ jobs:
             if (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(version)) {
               throw new Error(".version is not a stable semantic version");
             }
+            let publishedCurrent = false;
             try {
-              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: `v${version}` });
-              core.setOutput("unpublished_base_version", "");
-              return;
+              const currentRelease = await github.rest.repos.getReleaseByTag({
+                ...context.repo, tag: `v${version}`,
+              });
+              publishedCurrent = !currentRelease.data.draft && !currentRelease.data.prerelease;
             } catch (error) {
               if (error.status !== 404) throw error;
+            }
+            core.setOutput("published_current_version", String(publishedCurrent));
+            if (publishedCurrent) {
+              core.setOutput("unpublished_base_version", "");
+              return;
             }
             let latestVersion = "0.0.0";
             try {
@@ -289,6 +281,7 @@ jobs:
       - name: Compare exact base and proposed versions
         working-directory: source
         env:
+          PUBLISHED_CURRENT_VERSION: ${{ steps.baseline.outputs.published_current_version }}
           UNPUBLISHED_BASE_VERSION: ${{ steps.baseline.outputs.unpublished_base_version }}
         run: |
           if [[ -n "$BASE_REF" && "$BASE_REF" != "$ZERO_SHA" ]]; then
@@ -297,8 +290,10 @@ jobs:
             base_version="0.0.0"
           fi
           current_version="$(tr -d '\r\n' < .version)"
-          args="--base-version $base_version"
-          if [[ "$current_version" == "$base_version" && -n "$UNPUBLISHED_BASE_VERSION" ]]; then
-            args+=" --unpublished-base-version $UNPUBLISHED_BASE_VERSION"
+          args=""
+          if [[ "$current_version" != "$base_version" ]]; then
+            args="--base-version $base_version"
+          elif [[ "$PUBLISHED_CURRENT_VERSION" != "true" ]]; then
+            args="--base-version $base_version --unpublished-base-version $UNPUBLISHED_BASE_VERSION"
           fi
           make version-check PY=python VERSION_ARGS="$args"

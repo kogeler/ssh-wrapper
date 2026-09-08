@@ -12,6 +12,7 @@ import os
 import shlex
 import signal
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import cast
 
@@ -24,6 +25,13 @@ from ssh_wrapper.remote_process import (
     OwnedRemoteProcess,
     build_remote_supervisor_program,
 )
+
+
+def _is_running(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
 
 
 class LocalMux:
@@ -203,3 +211,260 @@ async def test_lease_expiry_and_malformed_frame_stop_remote_child(
         await remote.close()
         with pytest.raises(ProcessLookupError):
             os.kill(int(pid_file.read_text(encoding="utf-8")), 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leader_exits", (False, True))
+async def test_supervisor_cleans_descendants_even_after_group_leader_exits(
+    tmp_path: Path, leader_exits: bool
+) -> None:
+    leader_file = tmp_path / "leader.pid"
+    descendant_file = tmp_path / "descendant.pid"
+    descendant = (
+        "import os, pathlib, signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        f"pathlib.Path({str(descendant_file)!r}).write_text(str(os.getpid())); "
+        "time.sleep(60)"
+    )
+    leader = (
+        "import os, pathlib, subprocess, sys, time\n"
+        f"pathlib.Path({str(leader_file)!r}).write_text(str(os.getpid()))\n"
+        f"subprocess.Popen([sys.executable, '-c', {descendant!r}])\n"
+        f"while not pathlib.Path({str(descendant_file)!r}).exists(): time.sleep(0.01)\n"
+        + ("raise SystemExit(0)\n" if leader_exits else "time.sleep(60)\n")
+    )
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, LocalMux()),
+        (sys.executable, "-c", leader),
+        heartbeat_interval=0.02,
+        lease_timeout=0.5,
+        grace_timeout=0.1,
+    )
+    try:
+        await remote.start()
+        await _wait_for_file(descendant_file)
+        descendant_pid = int(descendant_file.read_text())
+        if leader_exits:
+            assert await asyncio.wait_for(remote.wait(), timeout=1) == 0
+        await asyncio.wait_for(remote.close(), timeout=1)
+        assert not _is_running(descendant_pid)
+    finally:
+        if leader_file.exists():
+            with suppress(ProcessLookupError):
+                os.killpg(int(leader_file.read_text()), signal.SIGKILL)
+        if remote.process is not None:
+            with suppress(ProcessLookupError):
+                os.killpg(remote.process.pid, signal.SIGKILL)
+            await remote.process.wait()
+        if remote._heartbeat_task is not None:
+            remote._heartbeat_task.cancel()
+            await asyncio.gather(remote._heartbeat_task, return_exceptions=True)
+        await asyncio.gather(*remote._drain_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_supervisor_observes_child_exit_without_waiting_for_next_heartbeat() -> (
+    None
+):
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, LocalMux()),
+        (sys.executable, "-c", "raise SystemExit(7)"),
+        heartbeat_interval=10,
+        lease_timeout=60,
+        grace_timeout=0.1,
+    )
+    try:
+        await remote.start()
+        assert await asyncio.wait_for(remote.wait(), timeout=1) == 7
+    finally:
+        await remote.close()
+
+
+@pytest.mark.parametrize("timeout", (float("nan"), float("inf"), -float("inf")))
+def test_remote_timeouts_reject_nonfinite_values(timeout: float) -> None:
+    for field in ("heartbeat_interval", "lease_timeout", "grace_timeout"):
+        timeouts = {
+            "heartbeat_interval": 0.1,
+            "lease_timeout": 1.0,
+            "grace_timeout": 0.1,
+        }
+        timeouts[field] = timeout
+        with pytest.raises(ValueError):
+            OwnedRemoteProcess(cast(OpenSSHMaster, LocalMux()), ("worker",), **timeouts)
+    for field in ("lease_timeout", "grace_timeout"):
+        timeouts = {"lease_timeout": 1.0, "grace_timeout": 0.1}
+        timeouts[field] = timeout
+        with pytest.raises(ValueError):
+            build_remote_supervisor_program(("worker",), **timeouts)
+
+
+@pytest.mark.parametrize("limit", (0, -1, True, 1.5))
+def test_bounded_storage_rejects_invalid_limits(limit: int) -> None:
+    with pytest.raises(ValueError):
+        BoundedTail(limit=limit)
+    with pytest.raises(ValueError):
+        OwnedRemoteProcess(
+            cast(OpenSSHMaster, LocalMux()),
+            ("worker",),
+            heartbeat_interval=1,
+            lease_timeout=2,
+            grace_timeout=1,
+            tail_bytes=limit,
+        )
+
+
+def test_bounded_storage_checks_initial_data_and_mutated_limits() -> None:
+    with pytest.raises(ValueError):
+        BoundedTail(limit=2, data=b"too long")
+    tail = BoundedTail(limit=2, data=b"ok")
+    tail.append(b"x" * 100_000 + b"yz")
+    assert tail.data == b"yz"
+    tail.limit = 0
+    with pytest.raises(ValueError):
+        tail.append(b"must not become unbounded")
+
+
+@pytest.mark.asyncio
+async def test_remote_start_is_single_use_even_while_readiness_is_pending() -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PendingMux(LocalMux):
+        async def ensure_ready(self) -> None:
+            entered.set()
+            await release.wait()
+
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, PendingMux()),
+        (sys.executable, "-c", "pass"),
+        heartbeat_interval=0.05,
+        lease_timeout=1,
+        grace_timeout=0.1,
+    )
+    first = asyncio.create_task(remote.start())
+    await entered.wait()
+    try:
+        with pytest.raises(SSHError, match="only be started once"):
+            await asyncio.wait_for(remote.start(), timeout=0.5)
+    finally:
+        release.set()
+        await first
+        await remote.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_close_cancels_pending_start_without_spawning() -> None:
+    entered = asyncio.Event()
+
+    class PendingMux(LocalMux):
+        async def ensure_ready(self) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, PendingMux()),
+        ("worker",),
+        heartbeat_interval=1,
+        lease_timeout=2,
+        grace_timeout=1,
+    )
+    startup = asyncio.create_task(remote.start())
+    await entered.wait()
+    await asyncio.wait_for(remote.close(), timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert remote.process is None
+
+
+@pytest.mark.asyncio
+async def test_remote_cancelled_close_still_reaps_child_and_drains(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "owned.pid"
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, LocalMux()),
+        _child_argv(pid_file),
+        heartbeat_interval=0.05,
+        lease_timeout=1,
+        grace_timeout=0.1,
+    )
+    await remote.start()
+    await _wait_for_file(pid_file)
+    closing = asyncio.create_task(remote.close())
+    await asyncio.sleep(0)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert remote.returncode is not None
+    assert all(task.done() for task in remote._drain_tasks)
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+    await remote.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_wait_does_not_release_remote_ownership(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "owned.pid"
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, LocalMux()),
+        _child_argv(pid_file),
+        heartbeat_interval=0.05,
+        lease_timeout=1,
+        grace_timeout=0.1,
+    )
+    await remote.start()
+    try:
+        await _wait_for_file(pid_file)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(remote.wait(), timeout=0.05)
+        assert remote.returncode is None
+        os.kill(int(pid_file.read_text()), 0)
+        assert remote._heartbeat_task is not None and not remote._heartbeat_task.done()
+    finally:
+        await remote.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remote_spawn_preserves_time_for_owned_group_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "owned.pid"
+    release = asyncio.Event()
+    original = asyncio.create_subprocess_exec
+
+    async def delayed_spawn(
+        *argv: str, **options: object
+    ) -> asyncio.subprocess.Process:
+        process = await original(*argv, **options)
+        await release.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_spawn)
+    remote = OwnedRemoteProcess(
+        cast(OpenSSHMaster, LocalMux()),
+        (
+            sys.executable,
+            "-c",
+            "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            + _child_argv(pid_file)[2],
+        ),
+        heartbeat_interval=0.05,
+        lease_timeout=1,
+        grace_timeout=0.4,
+    )
+    startup = asyncio.create_task(remote.start())
+    try:
+        await _wait_for_file(pid_file)
+        startup.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(startup, timeout=2)
+        assert not _is_running(int(pid_file.read_text()))
+    finally:
+        release.set()
+        if pid_file.exists():
+            with suppress(ProcessLookupError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        await asyncio.gather(startup, return_exceptions=True)
+        await remote.close()

@@ -7,24 +7,27 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import os
 import re
 import shlex
 import shutil
-import signal
 import stat
 import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from ._process import complete_task, finish_tasks, spawn_owned, stop_group, wait_exit
 from .bounded import BoundedTail
 from .errors import SSHError
 from .session_environment import resolve_session_environment
 
 CONTROL_CHECK_TIMEOUT = 5.0
 PROCESS_STOP_TIMEOUT = 5.0
-MAX_CONTROL_PATH_BYTES = 96
+# Linux sun_path allows 107 bytes plus NUL; OpenSSH appends '.' and 16 random
+# characters while atomically binding its temporary mux listener.
+MAX_CONTROL_PATH_BYTES = 90
 MASTER_STDERR_TAIL_BYTES = 16 * 1024
 MASTER_STDERR_READ_BYTES = 4096
 MASTER_STDERR_DRAIN_TIMEOUT = 1.0
@@ -55,17 +58,19 @@ SSH_USER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}\Z")
 
 SSH_ISOLATION_OPTIONS = (
     "ClearAllForwardings=yes",
+    "Tunnel=no",
     "ForwardAgent=no",
     "ForwardX11=no",
     "ForwardX11Trusted=no",
     "PermitLocalCommand=no",
     "RemoteCommand=none",
+    "ForkAfterAuthentication=no",
 )
 
 
 def validate_ssh_alias(value: str) -> str:
     """Validate one trusted OpenSSH alias token."""
-    if not SSH_ALIAS_PATTERN.fullmatch(value):
+    if not isinstance(value, str) or not SSH_ALIAS_PATTERN.fullmatch(value):
         raise SSHError(
             "invalid_connection",
             "ssh_alias must use only letters, digits, '.', '_', and '-' and cannot start with '-'",
@@ -75,6 +80,10 @@ def validate_ssh_alias(value: str) -> str:
 
 def validate_ssh_host(value: str) -> str:
     """Validate one direct IP address or conservative DNS name."""
+    if not isinstance(value, str) or (
+        "%" in value and not re.fullmatch(r"[A-Za-z0-9_.-]+", value.partition("%")[2])
+    ):
+        raise SSHError("invalid_connection", "host must be a valid host or IP address")
     try:
         ipaddress.ip_address(value)
     except ValueError:
@@ -88,7 +97,7 @@ def validate_ssh_host(value: str) -> str:
 
 def validate_ssh_user(value: str) -> str:
     """Validate one direct remote user token."""
-    if not SSH_USER_PATTERN.fullmatch(value):
+    if not isinstance(value, str) or not SSH_USER_PATTERN.fullmatch(value):
         raise SSHError(
             "invalid_connection",
             "user must use only letters, digits, '.', '_', '+', and '-' and cannot start with '-'",
@@ -227,6 +236,19 @@ class SSHMasterSettings:
     server_alive_count_max: int = 3
     runtime_prefix: str = "remote-ssh"
 
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.connect_timeout) or self.connect_timeout <= 0:
+            raise ValueError("connect_timeout must be positive and finite")
+        if any(
+            type(value) is not int or value < 0
+            for value in (self.server_alive_interval, self.server_alive_count_max)
+        ):
+            raise ValueError("server keepalive settings must be nonnegative integers")
+        if not self.runtime_prefix or any(
+            character in self.runtime_prefix for character in ("/", "\\", "\x00")
+        ):
+            raise ValueError("runtime_prefix must be a non-empty filename prefix")
+
 
 class ConnectionState(StrEnum):
     """Lifecycle states for one owned master."""
@@ -258,6 +280,8 @@ class OpenSSHMaster:
         self.state = ConnectionState.NEW
         self._stderr_tail = BoundedTail(MASTER_STDERR_TAIL_BYTES)
         self._stderr_task: asyncio.Task[None] | None = None
+        self._start_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     def _select_runtime_base(self) -> Path:
         if self._runtime_base is not None:
@@ -267,10 +291,12 @@ class OpenSSHMaster:
             if configured:
                 candidate = Path(configured)
                 try:
+                    if not candidate.is_absolute():
+                        raise OSError("XDG_RUNTIME_DIR is not absolute")
                     base = candidate.resolve(strict=True)
                     if not base.is_dir() or base.stat().st_uid != os.getuid():
                         raise OSError("XDG_RUNTIME_DIR is not an owned directory")
-                except OSError:
+                except (OSError, RuntimeError):
                     base = Path(tempfile.gettempdir()).resolve(strict=True)
             else:
                 base = Path(tempfile.gettempdir()).resolve(strict=True)
@@ -284,16 +310,18 @@ class OpenSSHMaster:
         base = self._select_runtime_base()
         prefix = f"{self.settings.runtime_prefix}-{os.getuid()}-"
         runtime = Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+        self.runtime_dir = runtime
         os.chmod(runtime, 0o700)
         control = runtime / "mux.sock"
 
-        if len(os.fsencode(control)) > MAX_CONTROL_PATH_BYTES:
+        if len(os.fsencode(control)) > MAX_CONTROL_PATH_BYTES or "${" in str(control):
             shutil.rmtree(runtime)
             fallback = Path(tempfile.gettempdir()).resolve(strict=True)
             runtime = Path(tempfile.mkdtemp(prefix=f"sw-{os.getuid()}-", dir=fallback))
+            self.runtime_dir = runtime
             os.chmod(runtime, 0o700)
             control = runtime / "m"
-        if len(os.fsencode(control)) > MAX_CONTROL_PATH_BYTES:
+        if len(os.fsencode(control)) > MAX_CONTROL_PATH_BYTES or "${" in str(control):
             shutil.rmtree(runtime)
             raise SSHError(
                 "connection_start_failed",
@@ -311,7 +339,7 @@ class OpenSSHMaster:
             "-M",
             "-N",
             "-S",
-            str(self.control_path),
+            str(self.control_path).replace("%", "%%"),
             "-o",
             "ControlMaster=yes",
             "-o",
@@ -336,7 +364,7 @@ class OpenSSHMaster:
             str(self.settings.ssh_path),
             "-T",
             "-S",
-            str(self.control_path),
+            str(self.control_path).replace("%", "%%"),
             "-o",
             "ControlMaster=no",
             "-o",
@@ -347,7 +375,9 @@ class OpenSSHMaster:
             "NumberOfPasswordPrompts=0",
             *(item for option in SSH_ISOLATION_OPTIONS for item in ("-o", option)),
             "-o",
-            f"ProxyCommand={self.settings.false_path}",
+            f"ProxyCommand={shlex.quote(str(self.settings.false_path)).replace('%', '%%')}",
+            "-o",
+            "StdinNull=no",
             "-o",
             "PubkeyAuthentication=no",
             "-o",
@@ -363,8 +393,12 @@ class OpenSSHMaster:
 
     def command_argv(self, remote_program: str) -> list[str]:
         """Append the exact destination and one fixed remote program."""
+        transport = self.mux_transport_argv()
         return [
-            *self.mux_transport_argv(),
+            transport[0],
+            "-o",
+            "SessionType=default",
+            *transport[1:],
             "--",
             self.connection.destination,
             remote_program,
@@ -408,28 +442,47 @@ class OpenSSHMaster:
     async def _control_operation(self, operation: str) -> tuple[int, bytes, bytes]:
         if self.control_path is None:
             return 255, b"", b"control socket is not initialized"
-        process = await asyncio.create_subprocess_exec(
-            str(self.settings.ssh_path),
-            "-S",
-            str(self.control_path),
+        process = await spawn_owned(
+            *self.mux_transport_argv(),
             "-O",
             operation,
-            *self.connection.ssh_options,
             "--",
             self.connection.destination,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=CONTROL_CHECK_TIMEOUT
+        stdout_tail = BoundedTail(MASTER_STDERR_TAIL_BYTES)
+        stderr_tail = BoundedTail(MASTER_STDERR_TAIL_BYTES)
+
+        async def drain(stream: asyncio.StreamReader, tail: BoundedTail) -> None:
+            while chunk := await stream.read(MASTER_STDERR_READ_BYTES):
+                tail.append(chunk)
+
+        drains = tuple(
+            asyncio.create_task(drain(stream, tail))
+            for stream, tail in (
+                (process.stdout, stdout_tail),
+                (process.stderr, stderr_tail),
             )
+            if stream is not None
+        )
+
+        async def cleanup() -> None:
+            try:
+                await stop_group(process, MASTER_STDERR_DRAIN_TIMEOUT)
+            finally:
+                await finish_tasks(drains, MASTER_STDERR_DRAIN_TIMEOUT)
+
+        try:
+            async with asyncio.timeout(CONTROL_CHECK_TIMEOUT):
+                await wait_exit(process)
+                await asyncio.gather(*drains)
+            return process.returncode or 0, stdout_tail.data, stderr_tail.data
         except TimeoutError:
-            process.kill()
-            await process.wait()
             return 255, b"", b"control operation timed out"
-        return process.returncode or 0, stdout, stderr
+        finally:
+            await complete_task(asyncio.create_task(cleanup()))
 
     def _socket_exists(self) -> bool:
         if self.control_path is None:
@@ -443,40 +496,24 @@ class OpenSSHMaster:
         while chunk := await stream.read(MASTER_STDERR_READ_BYTES):
             self._stderr_tail.append(chunk)
 
-    def _signal_master_group(self, process_signal: signal.Signals) -> None:
-        process = self.process
-        if process is None:
-            return
-        try:
-            os.killpg(process.pid, process_signal)
-        except ProcessLookupError:
-            pass
-
     async def _finish_stderr_drain(self, *, clear: bool) -> None:
         task = self._stderr_task
-        try:
-            if task is not None:
-                try:
-                    done, _pending = await asyncio.wait(
+
+        async def finish() -> None:
+            try:
+                if task is not None:
+                    _done, pending = await asyncio.wait(
                         (task,), timeout=MASTER_STDERR_DRAIN_TIMEOUT
                     )
-                    if not done:
-                        self._signal_master_group(signal.SIGTERM)
-                        done, _pending = await asyncio.wait(
-                            (task,), timeout=MASTER_STDERR_DRAIN_TIMEOUT
-                        )
-                    if not done:
-                        self._signal_master_group(signal.SIGKILL)
-                        task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                except asyncio.CancelledError:
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-                    raise
-        finally:
-            self._stderr_task = None
-            if clear:
-                self._stderr_tail.clear()
+                    if pending and self.process is not None:
+                        await stop_group(self.process, MASTER_STDERR_DRAIN_TIMEOUT)
+                    await finish_tasks((task,), MASTER_STDERR_DRAIN_TIMEOUT)
+            finally:
+                self._stderr_task = None
+                if clear:
+                    self._stderr_tail.clear()
+
+        await complete_task(asyncio.create_task(finish()))
 
     def _master_exit_error(self) -> SSHError:
         diagnostic = self._stderr_tail.text().casefold()
@@ -501,46 +538,58 @@ class OpenSSHMaster:
                 "connection_start_failed", "SSH master can only be started once"
             )
         self.state = ConnectionState.STARTING
-        self._create_runtime()
-
+        self._start_task = asyncio.create_task(self._start())
         try:
-            environment = await resolve_session_environment()
-            self.process = await asyncio.create_subprocess_exec(
-                *self._master_argv(),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=environment,
-                start_new_session=True,
-            )
-            if self.process.stderr is None:
-                raise SSHError(
-                    "connection_start_failed",
-                    "cannot capture SSH master diagnostics",
-                )
-            self._stderr_task = asyncio.create_task(
-                self._drain_master_stderr(self.process.stderr)
-            )
-            deadline = asyncio.get_running_loop().time() + self.settings.connect_timeout
-            while asyncio.get_running_loop().time() < deadline:
-                if self.process.returncode is not None:
-                    await self._finish_stderr_drain(clear=False)
-                    raise self._master_exit_error()
-                if self._socket_exists():
-                    returncode, _stdout, _stderr = await self._control_operation(
-                        "check"
-                    )
-                    if returncode == 0:
-                        self.state = ConnectionState.READY
-                        return
-                await asyncio.sleep(0.1)
+            await asyncio.shield(self._start_task)
+        except OSError:
+            await self.close()
             raise SSHError(
-                "connection_start_failed",
-                "SSH master did not become ready before the startup deadline",
-            )
+                "connection_start_failed", "cannot start the SSH master"
+            ) from None
         except BaseException:
             await self.close()
             raise
+
+    async def _start(self) -> None:
+        self._create_runtime()
+        environment = await resolve_session_environment()
+        self.process = await spawn_owned(
+            *self._master_argv(),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=environment,
+        )
+        if self.process.stderr is None:
+            raise SSHError(
+                "connection_start_failed",
+                "cannot capture SSH master diagnostics",
+            )
+        self._stderr_task = asyncio.create_task(
+            self._drain_master_stderr(self.process.stderr)
+        )
+        try:
+            async with asyncio.timeout(self.settings.connect_timeout):
+                await self._wait_ready()
+        except TimeoutError:
+            raise SSHError(
+                "connection_start_failed",
+                "SSH master did not become ready before the startup deadline",
+            ) from None
+
+    async def _wait_ready(self) -> None:
+        if self.process is None:
+            raise RuntimeError("SSH master process is not initialized")
+        while True:
+            if self.process.returncode is not None:
+                await self._finish_stderr_drain(clear=False)
+                raise self._master_exit_error()
+            if self._socket_exists():
+                returncode, _stdout, _stderr = await self._control_operation("check")
+                if returncode == 0:
+                    self.state = ConnectionState.READY
+                    return
+            await asyncio.sleep(0.1)
 
     async def ensure_ready(self) -> None:
         """Check the process, socket, and control operation without reconnecting."""
@@ -554,10 +603,15 @@ class OpenSSHMaster:
             or not self._socket_exists()
         ):
             self.state = ConnectionState.LOST
-            if self.process is not None and self.process.returncode is not None:
-                await self._finish_stderr_drain(clear=True)
             raise SSHError("connection_lost", "SSH master process or socket is gone")
-        returncode, _stdout, _stderr = await self._control_operation("check")
+        try:
+            returncode, _stdout, _stderr = await self._control_operation("check")
+        except OSError:
+            returncode = 255
+        if self.state is not ConnectionState.READY:
+            raise SSHError(
+                "connection_lost", "SSH master was closed during the control check"
+            )
         if returncode != 0:
             self.state = ConnectionState.LOST
             raise SSHError(
@@ -568,35 +622,33 @@ class OpenSSHMaster:
     async def _stop_process(self) -> None:
         if self.process is None or self.process.returncode is not None:
             return
-        try:
-            os.killpg(self.process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            await self.process.wait()
-            return
-        try:
-            await asyncio.wait_for(self.process.wait(), timeout=PROCESS_STOP_TIMEOUT)
-        except TimeoutError:
-            try:
-                os.killpg(self.process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await self.process.wait()
+        await stop_group(self.process, PROCESS_STOP_TIMEOUT)
 
     async def close(self) -> None:
         """Close the owned master and remove only its private runtime state."""
-        if self.state is ConnectionState.CLOSED:
-            return
-        self.state = ConnectionState.CLOSING
+        if self._close_task is None:
+            self.state = ConnectionState.CLOSING
+            self._close_task = asyncio.create_task(self._close())
+        await complete_task(self._close_task)
+
+    async def _close(self) -> None:
+        startup = self._start_task
+        if startup is not None and not startup.done():
+            startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
         try:
             if (
                 self.process is not None
                 and self.process.returncode is None
                 and self._socket_exists()
             ):
-                await self._control_operation("exit")
+                try:
+                    await self._control_operation("exit")
+                except OSError:
+                    pass
                 try:
                     await asyncio.wait_for(
-                        self.process.wait(), timeout=PROCESS_STOP_TIMEOUT
+                        wait_exit(self.process), timeout=PROCESS_STOP_TIMEOUT
                     )
                 except TimeoutError:
                     await self._stop_process()

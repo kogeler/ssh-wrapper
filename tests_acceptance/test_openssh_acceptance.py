@@ -1,20 +1,18 @@
 # Copyright (c) 2026 kogeler
 # SPDX-License-Identifier: MIT
 
-"""Hermetic acceptance against one unprivileged loopback OpenSSH server."""
+"""Shared live scenario: native host client and one isolated container server."""
 
 from __future__ import annotations
 
 import asyncio
-import getpass
 import os
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
-from contextlib import suppress
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -27,7 +25,8 @@ from ssh_wrapper import (
     SSHError,
     SSHMasterSettings,
 )
-from ssh_wrapper.connection import MASTER_STDERR_TAIL_BYTES
+from ssh_wrapper.connection import MASTER_STDERR_TAIL_BYTES, MAX_CONTROL_PATH_BYTES
+from tests_acceptance.container_server import ContainerServer, public_authorization
 
 pytestmark = [
     pytest.mark.acceptance,
@@ -40,44 +39,10 @@ pytestmark = [
 def _program(name: str) -> Path:
     resolved = shutil.which(name)
     if resolved is None:
-        pytest.skip(f"required OpenSSH acceptance command is unavailable: {name}")
+        pytest.fail(
+            f"required OpenSSH client command is unavailable: {name}", pytrace=False
+        )
     return Path(resolved).resolve(strict=True)
-
-
-def _unused_loopback_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
-
-
-async def _wait_for_text(path: Path, needle: str, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        with suppress(OSError):
-            if needle in path.read_text(encoding="utf-8"):
-                return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {needle!r}")
-
-
-async def _wait_for_file(path: Path, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        if path.is_file() and path.stat().st_size:
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"timed out waiting for {path.name}")
-
-
-async def _wait_for_pid_exit(pid: int, timeout: float = 5.0) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"owned process {pid} did not exit")
 
 
 def _generate_key(keygen: Path, destination: Path) -> None:
@@ -97,79 +62,101 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Prove one auth, mux-only channels, no fallback, and selective cleanup."""
+    await _exercise_openssh(tmp_path, monkeypatch)
+
+
+async def _exercise_openssh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fido_identity: Path | None = None,
+) -> None:
+    """Use identical lifecycle assertions for ephemeral and opt-in hardware keys."""
 
     ssh = _program("ssh")
-    sshd = _program("sshd")
-    keygen = _program("ssh-keygen")
     false = _program("false")
-    username = getpass.getuser()
-    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
-    monkeypatch.delenv("SSH_AGENT_PID", raising=False)
-    port = _unused_loopback_port()
-    host_key = tmp_path / "host-ed25519"
-    client_key = tmp_path / "client-ed25519"
-    authorized_keys = tmp_path / "authorized_keys"
-    known_hosts = tmp_path / "known_hosts"
-    server_config = tmp_path / "sshd_config"
-    client_config = tmp_path / "ssh_config"
-    server_log = tmp_path / "sshd.log"
-    server_pid_file = tmp_path / "sshd.pid"
-    wrapper = tmp_path / "isolated-ssh"
+    if fido_identity is None:
+        monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+        monkeypatch.delenv("SSH_AGENT_PID", raising=False)
+    client_key = tmp_path / (
+        "client-fido" if fido_identity is not None else "client-ed25519"
+    )
+    if fido_identity is None:
+        _generate_key(_program("ssh-keygen"), client_key)
+    else:
+        client_key.symlink_to(fido_identity)
+        Path(f"{client_key}.pub").symlink_to(Path(f"{fido_identity}.pub"))
+    public_key = Path(f"{client_key}.pub")
+    authorization = public_authorization(
+        public_key.read_text(encoding="utf-8"), fido=fido_identity is not None
+    )
+    async with ContainerServer(authorization) as server:
+        await _exercise_client(
+            tmp_path,
+            server,
+            ssh=ssh,
+            false=false,
+            client_key=client_key,
+            fido=fido_identity is not None,
+        )
 
-    _generate_key(keygen, host_key)
-    _generate_key(keygen, client_key)
-    key_type, key_data, *_rest = (
-        (client_key.with_suffix(".pub")).read_text(encoding="ascii").split()
+
+async def _exercise_client(
+    tmp_path: Path,
+    server: ContainerServer,
+    *,
+    ssh: Path,
+    false: Path,
+    client_key: Path,
+    fido: bool,
+) -> None:
+    """Keep the existing one-auth/mux/cleanup assertions common to both gates."""
+    # Prove that the image-owned PID 1 reaps orphans without host init injection.
+    # This uses the existing container control channel, not another SSH auth.
+    await server.python(
+        "import os,pathlib,time\n"
+        "assert pathlib.Path('/proc/1/comm').read_text().strip() == 'tini'\n"
+        "read_fd,write_fd=os.pipe(); parent=os.fork()\n"
+        "if parent == 0:\n"
+        " os.close(read_fd); child=os.fork()\n"
+        " if child == 0:\n"
+        "  os.close(write_fd); time.sleep(0.1); os._exit(0)\n"
+        " os.write(write_fd,str(child).encode()); os._exit(0)\n"
+        "os.close(write_fd); orphan=int(os.read(read_fd,64)); os.close(read_fd)\n"
+        "os.waitpid(parent,0); deadline=time.monotonic()+5\n"
+        "while pathlib.Path(f'/proc/{orphan}').exists():\n"
+        " if time.monotonic() >= deadline: raise RuntimeError('container init did not reap orphan')\n"
+        " time.sleep(0.05)\n"
     )
-    authorized_keys.write_text(
-        f"restrict {key_type} {key_data} ssh-wrapper-acceptance\n",
-        encoding="ascii",
-    )
-    authorized_keys.chmod(0o600)
-    host_type, host_data, *_rest = (
-        (host_key.with_suffix(".pub")).read_text(encoding="ascii").split()
-    )
+    known_hosts = tmp_path / "known_hosts"
+    client_config = tmp_path / "ssh_config"
+    wrapper = tmp_path / "isolated-ssh"
     known_hosts.write_text(
-        f"[127.0.0.1]:{port} {host_type} {host_data}\n", encoding="ascii"
+        f"[127.0.0.1]:{server.port} {server.host_key}\n", encoding="ascii"
     )
     known_hosts.chmod(0o600)
 
-    server_config.write_text(
-        "\n".join(
-            (
-                f"Port {port}",
-                "ListenAddress 127.0.0.1",
-                f"HostKey {host_key}",
-                f"PidFile {server_pid_file}",
-                f"AuthorizedKeysFile {authorized_keys}",
-                "StrictModes no",
-                "UsePAM no",
-                "AuthenticationMethods publickey",
-                "PubkeyAuthentication yes",
-                "PasswordAuthentication no",
-                "KbdInteractiveAuthentication no",
-                "HostbasedAuthentication no",
-                "PermitEmptyPasswords no",
-                "PermitRootLogin no",
-                f"AllowUsers {username}",
-                "DisableForwarding yes",
-                "PermitUserEnvironment no",
-                "LogLevel VERBOSE",
-                "Subsystem sftp internal-sftp",
-                "",
-            )
-        ),
-        encoding="utf-8",
-    )
     client_config.write_text(
         "\n".join(
             (
                 "Host *",
-                f"  IdentityFile {client_key}",
+                '  IdentityFile "'
+                + str(client_key)
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("%", "%%")
+                + '"',
                 "  IdentitiesOnly yes",
-                "  IdentityAgent none",
+                "  IdentityAgent none"
+                if not fido
+                else "  # Use native local FIDO/agent authentication",
                 "  AddKeysToAgent no",
-                f"  UserKnownHostsFile {known_hosts}",
+                '  UserKnownHostsFile "'
+                + str(known_hosts)
+                .replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("%", "%%")
+                + '"',
                 "  GlobalKnownHostsFile /dev/null",
                 "  StrictHostKeyChecking yes",
                 "  UpdateHostKeys no",
@@ -179,6 +166,10 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
                 "  HostbasedAuthentication no",
                 "  GSSAPIAuthentication no",
                 "  ProxyCommand none",
+                "  ForkAfterAuthentication yes",
+                "  StdinNull yes",
+                "  SessionType none",
+                "  Tunnel point-to-point",
                 "  LogLevel DEBUG3",
                 "",
             )
@@ -192,40 +183,46 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
     )
     wrapper.chmod(0o700)
 
-    log_stream = server_log.open("wb")
-    server = await asyncio.create_subprocess_exec(
-        str(sshd),
-        "-D",
-        "-e",
-        "-f",
-        str(server_config),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=log_stream,
-        start_new_session=True,
+    runtime_base = Path(tempfile.mkdtemp(prefix="swa-"))
+    # Exercise literal percent tokens at the longest safe native mux pathname.
+    runtime_prefix = "sw%h" + "x" * (
+        MAX_CONTROL_PATH_BYTES
+        - len(os.fsencode(runtime_base))
+        - len(str(os.getuid()))
+        - 24
     )
     master = OpenSSHMaster(
         SSHMasterSettings(
             ssh_path=wrapper,
             false_path=false,
-            connect_timeout=8,
+            connect_timeout=120 if fido else 8,
             server_alive_interval=2,
             server_alive_count_max=2,
-            runtime_prefix="ssh-wrapper-acceptance",
+            runtime_prefix=runtime_prefix,
         ),
-        ConnectionSpec.from_direct("127.0.0.1", username, port),
-        runtime_base=tmp_path,
+        ConnectionSpec.from_direct("127.0.0.1", server.username, server.port),
+        runtime_base=runtime_base,
     )
     unrelated_channel: asyncio.subprocess.Process | None = None
     unrelated_pid: int | None = None
+    owned: OwnedRemoteProcess | None = None
+    command: asyncio.subprocess.Process | None = None
+    fallback: asyncio.subprocess.Process | None = None
     try:
-        await _wait_for_text(server_log, "Server listening")
-        assert "SSH_AUTH_SOCK" not in os.environ
-        assert "IdentityAgent none" in client_config.read_text(encoding="utf-8")
-
+        if not fido:
+            assert "SSH_AUTH_SOCK" not in os.environ
+            assert "IdentityAgent none" in client_config.read_text(encoding="utf-8")
+        else:
+            print(
+                "FIDO: container server is ready; starting one authentication. Approve the native prompt/PIN and touch the key when requested; no secrets go through this test.",
+                flush=True,
+            )
         await master.start()
         assert master.state is ConnectionState.READY
         assert master.process is not None
+        assert master.control_path is not None
+        assert "%h" in str(master.control_path)
+        assert len(os.fsencode(master.control_path)) + 17 < 108
         first_master_pid = master.process.pid
         assert 0 < len(master._stderr_tail.data) <= MASTER_STDERR_TAIL_BYTES
 
@@ -239,10 +236,10 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
         assert command.returncode == 0 and stdout == b"mux-ok\n"
         assert master.process.pid == first_master_pid
 
-        unrelated_pid_file = tmp_path / "unrelated.pid"
+        unrelated_pid_file = server.directory / "unrelated.pid"
         unrelated_program = shlex.join(
             (
-                str(Path(sys.executable).resolve()),
+                "python3",
                 "-c",
                 (
                     "import os,sys,time; "
@@ -258,14 +255,13 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
         )
-        await _wait_for_file(unrelated_pid_file)
-        unrelated_pid = int(unrelated_pid_file.read_text(encoding="ascii"))
+        unrelated_pid = await server.wait_for_pid_file(unrelated_pid_file)
 
-        owned_pid_file = tmp_path / "owned.pid"
+        owned_pid_file = server.directory / "owned.pid"
         owned = OwnedRemoteProcess(
             master,
             (
-                str(Path(sys.executable).resolve()),
+                "python3",
                 "-c",
                 (
                     "import os,sys,time; "
@@ -279,17 +275,16 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
             tail_bytes=512,
         )
         await owned.start()
-        await _wait_for_file(owned_pid_file)
-        owned_pid = int(owned_pid_file.read_text(encoding="ascii"))
-        assert os.getpgid(owned_pid) == owned_pid
+        owned_pid = await server.wait_for_pid_file(owned_pid_file)
+        assert await server.process_group(owned_pid) == owned_pid
         await owned.close()
-        await _wait_for_pid_exit(owned_pid)
-        os.kill(unrelated_pid, 0)
+        await server.wait_for_pid_exit(owned_pid)
+        await server.signal(unrelated_pid, 0)
         assert len(owned.stdout_tail.data) <= 512
         assert len(owned.stderr_tail.data) <= 512
 
-        os.kill(unrelated_pid, signal.SIGTERM)
-        await _wait_for_pid_exit(unrelated_pid)
+        await server.signal(unrelated_pid, signal.SIGTERM)
+        await server.wait_for_pid_exit(unrelated_pid)
         await asyncio.wait_for(unrelated_channel.wait(), timeout=5)
         unrelated_channel = None
         unrelated_pid = None
@@ -311,26 +306,22 @@ async def test_real_openssh_one_auth_mux_and_owned_cleanup(
         await asyncio.wait_for(fallback.communicate(), timeout=5)
         assert fallback.returncode != 0
         await asyncio.sleep(0.2)
-        log = server_log.read_text(encoding="utf-8")
+        log = await server.logs()
         assert (
             sum(line.startswith("Connection from ") for line in log.splitlines()) == 1
         )
         assert sum("Accepted publickey for " in line for line in log.splitlines()) == 1
     finally:
+        if owned is not None:
+            await owned.close()
+        for channel in (command, fallback):
+            if channel is not None and channel.returncode is None:
+                channel.kill()
+                await channel.wait()
         if unrelated_channel is not None and unrelated_channel.returncode is None:
             unrelated_channel.kill()
             await unrelated_channel.wait()
-        if unrelated_pid is not None:
-            with suppress(ProcessLookupError):
-                os.kill(unrelated_pid, signal.SIGKILL)
         await master.close()
-        if server.returncode is None:
-            with suppress(ProcessLookupError):
-                os.killpg(server.pid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(server.wait(), timeout=5)
-            except TimeoutError:
-                with suppress(ProcessLookupError):
-                    os.killpg(server.pid, signal.SIGKILL)
-                await server.wait()
-        log_stream.close()
+        # ContainerServer's outer context reaps all remaining remote processes.
+        # Never interpret container PIDs as host PIDs, including on failure.
+        shutil.rmtree(runtime_base)

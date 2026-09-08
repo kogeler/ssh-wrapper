@@ -8,6 +8,7 @@
 /.venv-lock/
 /.venv-package/
 /.venv-test/
+/.venvs/
 /.artifacts/
 /build/
 /coverage.xml

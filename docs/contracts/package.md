@@ -19,8 +19,9 @@ the changelog MUST contain one matching dated section.
 
 **Contract:** Distribution metadata MUST use the `ssh-wrapper` name, identify
 `kogeler` as author and maintainer, declare only CPython 3.13 and 3.14 on Linux,
-include the complete reviewed classifiers, keywords, license, maintainer
-extras, and public project URLs, and render a README whose links remain valid
+include the complete reviewed classifiers, keywords, license, and public
+project URLs, omit runtime dependencies and internal maintainer extras, and
+render a README whose links remain valid
 on PyPI.
 
 **Evidence:**
@@ -48,7 +49,8 @@ MUST NOT produce native executables or platform-specific application bundles.
 metadata inventories, MUST include `LICENSE`, README metadata, and `py.typed`,
 MUST use canonical modes and timestamps, and MUST exclude tests, caches,
 private paths, foreign products, and generated repository state. Wheel RECORD
-hashes and sizes MUST match every member.
+hashes and sizes MUST match every member. The wheel generator MUST match the
+exact setuptools version owned by `requirements-package.in`.
 
 **Evidence:**
 

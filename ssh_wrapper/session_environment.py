@@ -6,13 +6,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import shlex
 import shutil
-import signal
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+
+from ._process import complete_task, finish_tasks, spawn_owned, stop_group, wait_exit
 
 SESSION_ENVIRONMENT_VARIABLES = (
     "DISPLAY",
@@ -58,22 +61,7 @@ async def _drain_bounded(
 
 
 async def _terminate_probe(process: asyncio.subprocess.Process) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    if process.returncode is not None:
-        return
-    try:
-        await asyncio.wait_for(process.wait(), timeout=PROBE_STOP_TIMEOUT)
-        return
-    except TimeoutError:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    await process.wait()
+    await stop_group(process, PROBE_STOP_TIMEOUT)
 
 
 async def _run_probe(
@@ -82,14 +70,13 @@ async def _run_probe(
     environment: Mapping[str, str],
 ) -> _ProbeResult | None:
     try:
-        process = await asyncio.create_subprocess_exec(
+        process = await spawn_owned(
             str(executable),
             *arguments,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=dict(environment),
-            start_new_session=True,
         )
     except OSError:
         return None
@@ -103,29 +90,24 @@ async def _run_probe(
     stderr_task = asyncio.create_task(
         _drain_bounded(process.stderr, PROBE_OUTPUT_LIMIT)
     )
-    try:
-        await asyncio.wait_for(process.wait(), timeout=PROBE_TIMEOUT)
-    except TimeoutError:
-        await _terminate_probe(process)
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        return None
-    except BaseException:
-        await _terminate_probe(process)
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-        raise
 
-    _done, pending = await asyncio.wait(
-        (stdout_task, stderr_task), timeout=PROBE_STOP_TIMEOUT
-    )
-    if pending:
-        await _terminate_probe(process)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
+    async def cleanup() -> None:
+        try:
+            await _terminate_probe(process)
+        finally:
+            await finish_tasks((stdout_task, stderr_task), PROBE_STOP_TIMEOUT)
+
+    try:
+        async with asyncio.timeout(PROBE_TIMEOUT):
+            await wait_exit(process)
+            await asyncio.gather(stdout_task, stderr_task)
+        return _ProbeResult(
+            process.returncode or 0, stdout_task.result(), stderr_task.result()
+        )
+    except TimeoutError:
         return None
-    stdout = stdout_task.result()
-    stderr = stderr_task.result()
-    return _ProbeResult(process.returncode or 0, stdout, stderr)
+    finally:
+        await complete_task(asyncio.create_task(cleanup()))
 
 
 def _resolve_optional_program(name: str) -> Path | None:
@@ -166,7 +148,9 @@ def _runtime_path(output: _BoundedProbeOutput, uid: int) -> Path | None:
     return resolved
 
 
-def _parse_systemd_environment(output: _BoundedProbeOutput) -> dict[str, str]:
+def _parse_systemd_environment(
+    output: _BoundedProbeOutput, *, json_output: bool = False
+) -> dict[str, str]:
     if output.truncated:
         return {}
     try:
@@ -175,10 +159,37 @@ def _parse_systemd_environment(output: _BoundedProbeOutput) -> dict[str, str]:
         return {}
     recovered: dict[str, str] = {}
     allowed = frozenset(SESSION_ENVIRONMENT_VARIABLES)
+    if json_output:
+        try:
+            document = json.loads(text)
+        except (ValueError, RecursionError):
+            return {}
+        if not isinstance(document, dict):
+            return {}
+        for name, value in document.items():
+            if (
+                name not in allowed
+                or not isinstance(value, str)
+                or not value
+                or "\x00" in value
+            ):
+                continue
+            try:
+                value.encode("utf-8")
+            except UnicodeError:
+                continue
+            recovered[name] = value
+        return recovered
     for line in text.splitlines():
         name, separator, value = line.partition("=")
-        if separator and name in allowed and value and "\x00" not in value:
-            recovered[name] = value
+        if not separator or name not in allowed or value.startswith("$'"):
+            continue
+        try:
+            fields = shlex.split(value)
+        except ValueError:
+            continue
+        if len(fields) == 1 and fields[0] and "\x00" not in fields[0]:
+            recovered[name] = fields[0]
     return recovered
 
 
@@ -216,13 +227,32 @@ async def resolve_session_environment(
     probe_environment["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime_path / 'bus'}"
     session_result = await _run_probe(
         systemctl,
-        ("--user", "show-environment"),
+        ("--user", "show-environment", "--output=json"),
         probe_environment,
     )
+    json_output = True
+    if session_result is not None and session_result.returncode != 0:
+        # Older systemd versions do not support JSON for show-environment.
+        json_output = False
+        session_result = await _run_probe(
+            systemctl, ("--user", "show-environment"), probe_environment
+        )
     if session_result is None or session_result.returncode != 0:
         return environment
 
-    for name, value in _parse_systemd_environment(session_result.stdout).items():
+    recovered = _parse_systemd_environment(
+        session_result.stdout, json_output=json_output
+    )
+    runtime_value = recovered.get("XDG_RUNTIME_DIR")
+    if (
+        runtime_value is not None
+        and _runtime_path(
+            _BoundedProbeOutput(runtime_value.encode("utf-8"), False), uid
+        )
+        is None
+    ):
+        del recovered["XDG_RUNTIME_DIR"]
+    for name, value in recovered.items():
         if not environment.get(name):
             environment[name] = value
     return environment

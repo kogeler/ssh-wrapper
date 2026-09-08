@@ -43,12 +43,19 @@ args = sys.argv[1:]
 def value(flag):
     return args[args.index(flag) + 1]
 
-socket_path = Path(value("-S"))
+socket_path = Path(value("-S").replace("%%", "%"))
 pid_path = Path(str(socket_path) + ".pid")
 count_path = os.environ.get("FAKE_SSH_AUTH_COUNT")
 
 if "-O" in args:
     operation = value("-O")
+    if os.environ.get("FAKE_SSH_HANG_CONTROL") == operation:
+        Path(os.environ["FAKE_SSH_CONTROL_PID"]).write_text(str(os.getpid()))
+        time.sleep(60)
+    if os.environ.get("FAKE_SSH_CONTROL_BYTES"):
+        for descriptor in (1, 2):
+            for _ in range(128):
+                os.write(descriptor, b"x" * 4096)
     if operation == "check":
         raise SystemExit(0 if socket_path.exists() else 255)
     if operation == "exit":
@@ -519,3 +526,187 @@ def test_direct_transport_and_private_wrapper_never_embed_destination(
         for path in master.runtime_dir.iterdir():
             path.unlink()
         master.runtime_dir.rmdir()
+
+
+@pytest.mark.asyncio
+async def test_master_close_during_environment_resolution_cannot_authenticate(
+    settings: SSHMasterSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, release = asyncio.Event(), asyncio.Event()
+    count = tmp_path / "auth-count"
+    monkeypatch.setenv("FAKE_SSH_AUTH_COUNT", str(count))
+
+    async def delayed_environment() -> dict[str, str]:
+        entered.set()
+        await release.wait()
+        return os.environ.copy()
+
+    monkeypatch.setattr(
+        connection_module, "resolve_session_environment", delayed_environment
+    )
+    master = OpenSSHMaster(
+        settings, ConnectionSpec.from_alias("test-target"), runtime_base=tmp_path
+    )
+    startup = asyncio.create_task(master.start())
+    await entered.wait()
+    try:
+        await asyncio.wait_for(master.close(), timeout=1)
+    finally:
+        release.set()
+        await asyncio.gather(startup, return_exceptions=True)
+    assert master.state is ConnectionState.CLOSED
+    assert master.process is None
+    assert not count.exists()
+    assert master.runtime_dir is not None and not master.runtime_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_and_concurrent_master_close_complete_cleanup(
+    settings: SSHMasterSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = OpenSSHMaster(
+        settings, ConnectionSpec.from_alias("test-target"), runtime_base=tmp_path
+    )
+    await master.start()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = master._control_operation
+
+    async def delayed_exit(operation: str) -> tuple[int, bytes, bytes]:
+        if operation == "exit":
+            entered.set()
+            await release.wait()
+        return await original(operation)
+
+    monkeypatch.setattr(master, "_control_operation", delayed_exit)
+    first = asyncio.create_task(master.close())
+    await entered.wait()
+    first.cancel()
+    await asyncio.sleep(0)
+    first.cancel()
+    second = asyncio.create_task(master.close())
+    await asyncio.sleep(0)
+    assert not first.done() and not second.done()
+    release.set()
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError) and results[1] is None
+    assert master.state is ConnectionState.CLOSED
+    assert master.process is not None and master.process.returncode is not None
+    assert master.runtime_dir is not None and not master.runtime_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_control_check_cancellation_reaps_its_process(
+    settings: SSHMasterSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = OpenSSHMaster(
+        settings, ConnectionSpec.from_alias("test-target"), runtime_base=tmp_path
+    )
+    await master.start()
+    pid_file = tmp_path / "control.pid"
+    monkeypatch.setenv("FAKE_SSH_HANG_CONTROL", "check")
+    monkeypatch.setenv("FAKE_SSH_CONTROL_PID", str(pid_file))
+    check = asyncio.create_task(master.ensure_ready())
+    try:
+        async with asyncio.timeout(2):
+            while not pid_file.exists():
+                await asyncio.sleep(0.01)
+        check.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await check
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+        assert master.state is ConnectionState.READY
+    finally:
+        await master.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_deadline_also_bounds_control_checks(
+    settings: SSHMasterSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = OpenSSHMaster(
+        settings, ConnectionSpec.from_alias("test-target"), runtime_base=tmp_path
+    )
+    pid_file = tmp_path / "control.pid"
+    monkeypatch.setenv("FAKE_SSH_HANG_CONTROL", "check")
+    monkeypatch.setenv("FAKE_SSH_CONTROL_PID", str(pid_file))
+    async with asyncio.timeout(2):
+        with pytest.raises(SSHError, match="startup deadline"):
+            await master.start()
+    assert master.state is ConnectionState.CLOSED
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+@pytest.mark.asyncio
+async def test_runtime_failure_has_stable_path_free_error_and_terminal_state(
+    settings: SSHMasterSettings, tmp_path: Path
+) -> None:
+    master = OpenSSHMaster(
+        settings,
+        ConnectionSpec.from_alias("test-target"),
+        runtime_base=tmp_path / "missing-private-path",
+    )
+    with pytest.raises(SSHError) as error:
+        await master.start()
+    assert error.value.code == "connection_start_failed"
+    assert str(tmp_path) not in str(error.value)
+    assert master.state is ConnectionState.CLOSED
+    with pytest.raises(SSHError, match="only be started once"):
+        await master.start()
+
+
+@pytest.mark.asyncio
+async def test_closing_during_readiness_cannot_restore_ready_or_lost_state(
+    settings: SSHMasterSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = OpenSSHMaster(
+        settings, ConnectionSpec.from_alias("test-target"), runtime_base=tmp_path
+    )
+    await master.start()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = master._control_operation
+
+    async def delayed_check(operation: str) -> tuple[int, bytes, bytes]:
+        if operation == "check":
+            entered.set()
+            await release.wait()
+            return 255, b"", b""
+        return await original(operation)
+
+    monkeypatch.setattr(master, "_control_operation", delayed_check)
+    check = asyncio.create_task(master.ensure_ready())
+    await entered.wait()
+    await master.close()
+    release.set()
+    with pytest.raises(SSHError) as error:
+        await check
+    assert error.value.code == "connection_lost"
+    assert master.state is ConnectionState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_control_output_is_bounded_and_fully_drained(
+    settings: SSHMasterSettings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    master = OpenSSHMaster(
+        settings, ConnectionSpec.from_alias("test-target"), runtime_base=tmp_path
+    )
+    await master.start()
+    monkeypatch.setenv("FAKE_SSH_CONTROL_BYTES", "1")
+    try:
+        status, stdout, stderr = await master._control_operation("check")
+        assert status == 0
+        assert stdout == stderr == b"x" * connection_module.MASTER_STDERR_TAIL_BYTES
+    finally:
+        await master.close()
+
+
+@pytest.mark.parametrize(
+    "host", ("fe80::1%bad scope", "fe80::1%bad\x00scope", "fe80::1%a;b")
+)
+def test_scoped_ipv6_rejects_unsafe_zone_identifiers(host: str) -> None:
+    with pytest.raises(SSHError) as error:
+        ConnectionSpec.from_direct(host, "deploy")
+    assert error.value.code == "invalid_connection"
+    assert ConnectionSpec.from_direct("fe80::1%eth0", "deploy").host == "fe80::1%eth0"

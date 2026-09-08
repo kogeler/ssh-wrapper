@@ -8,11 +8,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
+import math
 import shlex
-import signal
 from contextlib import suppress
 
+from ._process import complete_task, finish_tasks, spawn_owned, stop_group, wait_exit
 from .bounded import DEFAULT_TAIL_BYTES, BoundedTail
 from .connection import OpenSSHMaster
 from .errors import SSHError
@@ -28,6 +28,7 @@ LOCAL_STOP_TIMEOUT = 10.0
 REMOTE_SUPERVISOR = r"""
 import base64
 import json
+import math
 import os
 import select
 import signal
@@ -51,16 +52,20 @@ def decode_argv(value):
     return argv
 
 def terminate_group(process, grace):
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        process.wait()
         return
     deadline = time.monotonic() + grace
-    while process.poll() is None and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        process.poll()
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
         time.sleep(0.05)
-    if process.poll() is None:
+    else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
@@ -75,7 +80,7 @@ def main():
         grace = float(sys.argv[2])
     except ValueError:
         return 64
-    if lease <= 0 or grace <= 0:
+    if not all(math.isfinite(value) and value > 0 for value in (lease, grace)):
         return 64
     argv = decode_argv(sys.argv[3])
     stopping = False
@@ -98,21 +103,22 @@ def main():
         sys.stderr.flush()
         return 72
 
-    sys.stderr.write("SSH_WRAPPER_REMOTE_STARTED_V1\n")
-    sys.stderr.flush()
     last_heartbeat = time.monotonic()
     pending = bytearray()
     status = 0
     try:
+        sys.stderr.write("SSH_WRAPPER_REMOTE_STARTED_V1\n")
+        sys.stderr.flush()
         while child.poll() is None and not stopping:
             remaining = lease - (time.monotonic() - last_heartbeat)
             if remaining <= 0:
                 status = 71
                 break
-            readable, _, _ = select.select([sys.stdin.buffer], [], [], remaining)
+            readable, _, _ = select.select(
+                [sys.stdin.buffer], [], [], min(remaining, 0.05)
+            )
             if not readable:
-                status = 71
-                break
+                continue
             chunk = os.read(sys.stdin.fileno(), 4096)
             if not chunk:
                 break
@@ -142,8 +148,16 @@ def build_remote_supervisor_program(
     argv: tuple[str, ...], *, lease_timeout: float, grace_timeout: float
 ) -> str:
     """Encode child argv as data in one fixed remote supervisor command."""
-    if not argv or len(argv) > 256 or any("\x00" in item for item in argv):
+    if (
+        not argv
+        or len(argv) > 256
+        or any(not isinstance(item, str) or "\x00" in item for item in argv)
+    ):
         raise ValueError("remote child argv is invalid")
+    if not all(
+        math.isfinite(value) and value > 0 for value in (lease_timeout, grace_timeout)
+    ):
+        raise ValueError("remote process timeouts must be positive and finite")
     payload = (
         base64.urlsafe_b64encode(
             json.dumps(list(argv), ensure_ascii=False, separators=(",", ":")).encode(
@@ -158,8 +172,8 @@ def build_remote_supervisor_program(
             "python3",
             "-c",
             REMOTE_SUPERVISOR,
-            f"{lease_timeout:g}",
-            f"{grace_timeout:g}",
+            str(lease_timeout),
+            str(grace_timeout),
             payload,
         )
     )
@@ -178,8 +192,11 @@ class OwnedRemoteProcess:
         grace_timeout: float,
         tail_bytes: int = DEFAULT_TAIL_BYTES,
     ) -> None:
-        if heartbeat_interval <= 0 or lease_timeout <= 0 or grace_timeout <= 0:
-            raise ValueError("remote process timeouts must be positive")
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (heartbeat_interval, lease_timeout, grace_timeout)
+        ):
+            raise ValueError("remote process timeouts must be positive and finite")
         self.master = master
         self.argv = argv
         self.heartbeat_interval = heartbeat_interval
@@ -192,6 +209,8 @@ class OwnedRemoteProcess:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._drain_tasks: tuple[asyncio.Task[None], ...] = ()
         self._closed = False
+        self._start_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     async def _drain(
         self,
@@ -211,17 +230,34 @@ class OwnedRemoteProcess:
         process = self.process
         if process is None or process.stdin is None:
             return
-        while process.returncode is None:
-            process.stdin.write(HEARTBEAT_FRAME)
-            await process.stdin.drain()
-            await asyncio.sleep(self.heartbeat_interval)
+        try:
+            while process.returncode is None:
+                process.stdin.write(HEARTBEAT_FRAME)
+                await process.stdin.drain()
+                try:
+                    await asyncio.wait_for(
+                        wait_exit(process), timeout=self.heartbeat_interval
+                    )
+                except TimeoutError:
+                    continue
+                return
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     async def start(self) -> None:
         """Start through the ready mux and begin draining and heartbeats."""
-        if self.process is not None or self._closed:
+        if self._start_task is not None or self._closed:
             raise SSHError(
                 "remote_process_start_failed", "remote process can only be started once"
             )
+        self._start_task = asyncio.create_task(self._start())
+        try:
+            await asyncio.shield(self._start_task)
+        except BaseException:
+            await self.close()
+            raise
+
+    async def _start(self) -> None:
         await self.master.ensure_ready()
         remote_program = build_remote_supervisor_program(
             self.argv,
@@ -229,20 +265,18 @@ class OwnedRemoteProcess:
             grace_timeout=self.grace_timeout,
         )
         try:
-            self.process = await asyncio.create_subprocess_exec(
+            self.process = await spawn_owned(
                 *self.master.command_argv(remote_program),
+                owner_close_timeout=self.grace_timeout + LOCAL_STOP_TIMEOUT,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
             )
         except OSError as error:
             raise SSHError(
                 "remote_process_start_failed", "cannot start the remote supervisor"
             ) from error
         if self.process.stdout is None or self.process.stderr is None:
-            self.process.kill()
-            await self.process.wait()
             raise SSHError(
                 "remote_process_start_failed",
                 "cannot capture remote supervisor output",
@@ -264,13 +298,22 @@ class OwnedRemoteProcess:
             raise SSHError(
                 "remote_process_not_started", "remote process is not started"
             )
-        return await self.process.wait()
+        result = await wait_exit(self.process)
+        await finish_tasks(self._drain_tasks, LOCAL_STOP_TIMEOUT)
+        return result
 
     async def close(self) -> None:
         """Close ownership, reap the supervisor, and stop local drain tasks."""
-        if self._closed:
-            return
-        self._closed = True
+        if self._close_task is None:
+            self._closed = True
+            self._close_task = asyncio.create_task(self._close())
+        await complete_task(self._close_task)
+
+    async def _close(self) -> None:
+        startup = self._start_task
+        if startup is not None and not startup.done():
+            startup.cancel()
+            await asyncio.gather(startup, return_exceptions=True)
         heartbeat = self._heartbeat_task
         if heartbeat is not None:
             heartbeat.cancel()
@@ -280,28 +323,20 @@ class OwnedRemoteProcess:
                 await heartbeat
 
         process = self.process
-        if process is not None and process.stdin is not None:
-            process.stdin.close()
-            with suppress(BrokenPipeError, ConnectionResetError):
-                await process.stdin.wait_closed()
-        if process is not None and process.returncode is None:
-            try:
-                await asyncio.wait_for(
-                    process.wait(),
-                    timeout=self.grace_timeout + LOCAL_STOP_TIMEOUT,
-                )
-            except TimeoutError:
+        try:
+            if process is not None and process.stdin is not None:
+                process.stdin.close()
+                with suppress(BrokenPipeError, ConnectionResetError, TimeoutError):
+                    await asyncio.wait_for(
+                        process.stdin.wait_closed(), timeout=LOCAL_STOP_TIMEOUT
+                    )
+            if process is not None and process.returncode is None:
                 try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=LOCAL_STOP_TIMEOUT)
+                    await asyncio.wait_for(
+                        wait_exit(process),
+                        timeout=self.grace_timeout + LOCAL_STOP_TIMEOUT,
+                    )
                 except TimeoutError:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    await process.wait()
-        if self._drain_tasks:
-            await asyncio.gather(*self._drain_tasks, return_exceptions=True)
+                    await stop_group(process, LOCAL_STOP_TIMEOUT)
+        finally:
+            await finish_tasks(self._drain_tasks, LOCAL_STOP_TIMEOUT)

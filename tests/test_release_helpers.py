@@ -14,6 +14,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIRECTORY = ROOT / ".github/scripts"
 VERSION = "1.2.3"
@@ -41,6 +43,44 @@ def test_pr_body_preserves_manual_text_and_replaces_only_managed_content() -> No
     assert helper.updated_body(existing, section) == (
         f"Before.\n\n{start}\n## [1.2.3] - 2026-08-30\n\n- Exact.\n{end}\n\nAfter.\n"
     )
+
+
+def test_pr_body_prefers_populated_unreleased_without_a_version_change() -> None:
+    helper = _module("pr_body")
+    section = helper.latest_changelog_section(
+        "# Changelog\r\n\r\n## Unreleased\r\n\r\n### Changed\r\n\r\n"
+        "- Pending change.\r\n\r\n## [0.1.0] - 2026-08-30\r\n\r\n- Published.\r\n"
+    )
+    body = helper.updated_body("Manual context.\n", section)
+    assert body == (
+        f"Manual context.\n\n{helper.START_MARKER}\n## Unreleased\n\n"
+        f"### Changed\n\n- Pending change.\n{helper.END_MARKER}\n"
+    )
+    assert helper.updated_body(body, section) == body
+
+
+def test_pr_body_rejects_malformed_markers_and_empty_notes() -> None:
+    helper = _module("pr_body")
+    for changelog in (
+        "# Changelog\n",
+        "## Unreleased\n",
+        f"## Unreleased\n\n- {helper.START_MARKER}\n",
+    ):
+        with pytest.raises(helper.PullRequestBodyError):
+            helper.latest_changelog_section(changelog)
+    for body in (
+        helper.START_MARKER,
+        helper.END_MARKER + helper.START_MARKER,
+        (helper.START_MARKER + helper.END_MARKER) * 2,
+    ):
+        with pytest.raises(
+            helper.PullRequestBodyError, match="invalid managed markers"
+        ):
+            helper.updated_body(body, "## Unreleased\n\n- Pending.")
+    with pytest.raises(helper.PullRequestBodyError, match="body limit"):
+        helper.updated_body(
+            "x" * helper.MAX_PR_BODY_BYTES, "## Unreleased\n\n- Pending."
+        )
 
 
 def _pypi_fixture(root: Path) -> tuple[Path, Path]:

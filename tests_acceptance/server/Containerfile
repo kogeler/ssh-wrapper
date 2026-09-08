@@ -1,0 +1,21 @@
+# Copyright (c) 2026 kogeler. SPDX-License-Identifier: MIT.
+
+FROM docker.io/library/python@sha256:1a3c6dbfd2173971abba880c3cc2ec4643690901f6ad6742d0827bae6cefc925
+
+# The base digest and signed Debian snapshot pin the complete fixture toolchain.
+# No packages or server services are installed on the client's host.
+RUN . /etc/os-release && \
+    test "$ID" = debian && \
+    rm -f /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources && \
+    printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/20260908T000000Z/ %s main\n' "$VERSION_CODENAME" > /etc/apt/sources.list && \
+    printf 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian-security/20260908T000000Z/ %s-security main\n' "$VERSION_CODENAME" >> /etc/apt/sources.list && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends openssh-server tini && \
+    useradd --uid 10000 --home-dir /tmp/ssh-wrapper --no-create-home --password x fixture && \
+    mkdir -p /run/sshd && \
+    chmod 0755 /run/sshd
+
+COPY --chmod=0644 server.py /opt/ssh-wrapper/server.py
+USER 10000:10000
+# Keep PID 1 and orphan reaping inside this pinned image, not on the client host.
+ENTRYPOINT ["/usr/bin/tini", "--", "python3", "/opt/ssh-wrapper/server.py"]

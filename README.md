@@ -20,7 +20,7 @@ consumer protocol.
 Install an exact reviewed version with pip:
 
 ```bash
-python3.13 -m pip install "ssh-wrapper==0.1.0"
+python3.13 -m pip install "ssh-wrapper==0.1.1"
 ```
 
 Use `python3.14` in the same command when that is the selected supported

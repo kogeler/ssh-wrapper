@@ -7,6 +7,16 @@
 dated changelog section derive from it. `tools/version.py` is the single local
 owner for version validation and exact release-note rendering.
 
+Ordinary changes retain the published `.version` and accumulate release-worthy
+notes under `## Unreleased`. Multiple merged PRs can share that section.
+Deliberate release preparation advances `.version`, moves accumulated entries
+into the matching dated section, and leaves an empty `Unreleased` heading.
+
+When a PR changes `CHANGELOG.md`, the trusted PR metadata workflow mirrors its
+newest populated level-two section, normally `Unreleased`, into one managed
+body block. A version change is not required. Manual text outside the markers
+is preserved; malformed markers and concurrent body edits stop synchronization.
+
 Build and inspect a candidate with:
 
 ```bash
@@ -29,12 +39,18 @@ The tag is `vX.Y.Z`, and the GitHub release has the same name. Its target is the
 direct `main` commit, its body is the exact current changelog section, and its
 assets are exactly the wheel, sdist, and checksum inventory.
 
-The direct-main release workflow independently inspects PyPI files and GitHub
-tag/release state while reusable CI runs once for the same commit. CI's
+Every direct-main push first inspects PyPI files and GitHub tag/release state.
+If the current version is already fully and exactly published, reusable release
+CI and both publication jobs are skipped. Published metadata is checked against
+the immutable tagged source, so later main commits and accumulated `Unreleased`
+notes do not conflict with the original release. Ordinary PR CI still validates
+those changes and permits retaining an already published stable version.
+
+When publication work is needed, reusable CI runs once for the release commit. CI's
 distribution job builds, smokes, and conditionally uploads one immutable
 workflow artifact for the trusted release caller. The release workflow never
 rebuilds it: PyPI Trusted Publishing and the GitHub release consume those same
-bytes in order. An already published state is an exact verified no-op.
+bytes in order. Draft recovery remains tied to the current release commit.
 Conflicting names, versions, yanked state, targets, notes, sizes, or hashes stop
 recovery without replacing history.
 
@@ -64,8 +80,9 @@ The path-filtered `Strict offline documentation build` must pass on
 documentation changes; do not configure it as an unconditional status check
 for pull requests that do not start the Documentation workflow.
 
-After reviewing a clean candidate tree, the operator creates the first commit
-on `main`, completes these settings, and pushes. The workflows perform
+After reviewing the release candidate and completing these settings, the
+operator merges or deliberately advances the release commit onto `main` and
+pushes it through the repository's review process. The workflows perform
 publication only from trusted direct-main state. See the
 [CI and release contract](../contracts/ci_releases.md) for exact permission and
 recovery rules.

@@ -43,15 +43,20 @@ MUST NOT be presented as support for an undeclared non-Linux runtime platform.
 ### `CMP-004` - Linux-specific behavior is isolated and accepted with OpenSSH
 
 **Contract:** Linux session recovery MUST degrade to the inherited environment
-when its optional probes are unavailable or invalid. CI MUST provision an
-OpenSSH server package whose exact Debian version matches the runner's installed
-client before real mux and cleanup behavior is tested against an isolated
-loopback server.
+when its optional probes are unavailable or invalid. Local and CI acceptance
+MUST test the native host client against the same container-only OpenSSH server.
+The test image MUST pin its base by digest and server packages through a signed
+immutable Debian snapshot; it MUST NOT depend on the host distribution's server
+package or exact client/server version equality. The host MUST provide a working
+Podman or Docker engine and native OpenSSH client, but MUST NOT need `sshd`
+or an engine-injected init binary. The server image MUST supply its own init.
 
 **Evidence:**
 
 - [`test_ci_preserves_quality_python_package_and_openssh_gates`](../../tests/test_ci_policy.py) - `tests/test_ci_policy.py::test_ci_preserves_quality_python_package_and_openssh_gates`
 - [`test_missing_probe_executables_are_a_noop`](../../tests/test_session_environment.py) - `tests/test_session_environment.py::test_missing_probe_executables_are_a_noop`
+- [`test_make_and_ci_share_the_pinned_server_without_host_sshd`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_make_and_ci_share_the_pinned_server_without_host_sshd`
+- [`test_server_runs_when_the_engine_has_no_host_init_binary`](../../tests/test_acceptance_support.py) - `tests/test_acceptance_support.py::test_server_runs_when_the_engine_has_no_host_init_binary`
 - [`test_real_openssh_one_auth_mux_and_owned_cleanup`](../../tests_acceptance/test_openssh_acceptance.py) - `tests_acceptance/test_openssh_acceptance.py::test_real_openssh_one_auth_mux_and_owned_cleanup`
 
 ### `CMP-005` - OpenSSH and remote Python are capability prerequisites

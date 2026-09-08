@@ -14,7 +14,7 @@ native client, and interactive-session recovery is Linux-specific.
 Install an exact reviewed release with pip:
 
 ```bash
-python3.13 -m pip install "ssh-wrapper==0.1.0"
+python3.13 -m pip install "ssh-wrapper==0.1.1"
 ```
 
 Replace `python3.13` with `python3.14` when using the other supported minor.
@@ -23,7 +23,7 @@ For a virtual environment:
 
 ```bash
 python3.13 -m venv .venv
-.venv/bin/python -m pip install "ssh-wrapper==0.1.0"
+.venv/bin/python -m pip install "ssh-wrapper==0.1.1"
 ```
 
 The project installs no command-line entry point. `pipx` is therefore not an
